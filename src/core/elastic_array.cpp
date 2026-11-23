@@ -54,9 +54,9 @@ bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) 
         if (bytes > host_start_) bytes = host_start_;
         if (bytes <= backed_) return true;
     }
-    // grow in steps of a few granules so a long generation maps rarely
-    const uint64_t step = gran_ * 4;
-    const uint64_t want = std::min(reserved_, (bytes + step - 1) / step * step);
+    // map only to the requested bound, rounded UP to the granule the driver requires: never more
+    // than one granule past the bound (the plan charges the raw slice, so keep the overshoot small)
+    const uint64_t want = std::min((bytes + gran_ - 1) / gran_ * gran_, reserved_);
     const uint64_t n = want - backed_;
     if (keep_free > 0) {
         uint64_t free_b = 0, total_b = 0;
@@ -91,6 +91,23 @@ bool ElasticArray::back_host(uint64_t bytes, std::string& err) {
         err = "the array is full";
         return false;
     }
+    const uint64_t hg = vmm::host_granularity();
+    if (hg == 0) {
+        err = "host backing needs virtual memory management";
+        return false;
+    }
+    // the host tail must be host-granularity aligned: pad the end up (into the reservation) so `map_host` fits
+    if (bytes % hg) {
+        const uint64_t padded = (bytes + hg - 1) / hg * hg;
+        if (padded <= reserved_) {
+            bytes = padded;
+        } else if (reserved_ % hg == 0) {
+            bytes = reserved_;
+        } else {
+            err = "the host tail cannot be padded to the host granularity inside the reservation";
+            return false;
+        }
+    }
     if (host_start_ == kNoHost) host_start_ = backed_;
     const uint64_t kHostPiece = 2ull << 30;   // the driver's single host allocation limit
     uint64_t at = backed_;
@@ -101,7 +118,6 @@ bool ElasticArray::back_host(uint64_t bytes, std::string& err) {
             err = "out of host memory for the streamed range";   // what was mapped before stays backed
             return false;
         }
-        cudaMemset(base_ + at, 0, n);
         extents_.push_back({at, n, h, true});
         backed_ = at + n;
         at = backed_;
