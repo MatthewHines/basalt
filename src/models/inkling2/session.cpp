@@ -347,7 +347,7 @@ public:
         for (cudaEvent_t& e : stage_ev_)
             if (ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) ok = false;
         if (!ok) {
-            err = "out of device memory for the session";
+            if (err.empty()) err = "out of device memory for the session";
             return false;
         }
         // the scratch every session of the model shares: the first session makes it
@@ -624,6 +624,15 @@ public:
     // the base), and the RAM experts come back to the card while it has room.
     void restart_positions(int64_t positions) {
         if (elastic_.empty()) return;
+        // streaming: the resident slice and the host tail are mapped by design and stay put — trimming the
+        // resident extents here would unmap live cache (and the ensure path cannot re-map past the host boundary)
+        if (m_.kv_resident() > 0) {
+            if (m_.promoted() < m_.spill().spilled) {
+                cudaStreamSynchronize(stream_);
+                m_.promote(kElasticKeep);
+            }
+            return;
+        }
         const int64_t keep = std::max<int64_t>(core::kElasticKvBase, (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
         if (keep < backed_) {
             cudaStreamSynchronize(stream_);

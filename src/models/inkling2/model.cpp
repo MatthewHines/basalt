@@ -98,6 +98,16 @@ uint64_t session_device_bytes(const Geometry& g, int64_t context, bool fp8, int6
     return session_bytes(g, context, fp8) - (uint64_t) global * per_pos * (uint64_t) (context - resident);
 }
 
+uint64_t session_host_bytes(const Geometry& g, int64_t context, bool fp8, int64_t resident) {
+    if (resident <= 0 || resident >= context) return 0;
+    int global = 0;
+    for (const Visit& v : g.visits)
+        if (!g.swa[(size_t) v.layer]) global += 1;
+    const uint64_t elem = fp8 ? 1 : 2;
+    const uint64_t per_pos = 2ull * kKvHeads * kHeadDim * elem;
+    return (uint64_t) global * per_pos * (uint64_t) (context - resident);
+}
+
 InklingModel::InklingModel() = default;
 
 InklingModel::~InklingModel() {
@@ -389,6 +399,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
             return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
         };
+        if (kv_res_ > 0)
+            basalt::log::info("basalt inkling2", "K/V streaming: %lld of %lld cells per layer in VRAM, %.2f GiB in page-locked RAM per slot (the drafter's caches stay on the card)",
+                              (long long) kv_res_, (long long) want, (double) session_host_bytes(g, want, fp8_, kv_res_) / (double) kGiB);
         const auto bytes_dev = [&](int64_t c) {   // the card's share (DSPARK HOOK: the drafter rides beside it, always resident)
             return session_device_bytes(g, c, fp8_, kv_res_) +
                    (dspark_ ? dspark_session_bytes(pack_, c) : 0);
@@ -447,7 +460,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                     for (int l = 0; l < g.n_layers; ++l)
                         for (int e = 0; e < g.n_expert; ++e)
                             if (!on_card(l, e)) spill_order_.emplace_back(l, e);
-                elastic_ = keep < 0 && want > core::kElasticKvBase;
+                elastic_ = (kv_res_ > 0) || (keep < 0 && want > core::kElasticKvBase);
                 uint64_t ram = 0;
                 for (int l = 0; l < g.n_layers; ++l) ram += (uint64_t) spill_.n_spill[(size_t) l] * stride[(size_t) l];
                 basalt::log::info("basalt inkling2",
@@ -474,10 +487,17 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         if (need > avail) {
             const uint64_t per = bytes_dev(2) - bytes_dev(1);
             const uint64_t base = bytes_dev(0);
-            const int64_t fits = avail > base ? (int64_t) ((avail - base) / per) : 0;
+            if (per > 0 && avail > base) {
+                const int64_t fits = (int64_t) ((avail - base) / per);
+                return {model::Status::Error, "inkling2: --max-context " + std::to_string(want) + " needs " +
+                                                  std::to_string(need / kMiB) + " MiB a session; about " + std::to_string(fits) +
+                                                  " positions fit" + (fp8_ || int8_ ? "" : " (--kv fp8 halves a position's bytes)")};
+            }
             return {model::Status::Error, "inkling2: --max-context " + std::to_string(want) + " needs " +
-                                              std::to_string(need / kMiB) + " MiB a session; about " + std::to_string(fits) +
-                                              " positions fit" + (fp8_ || int8_ ? "" : " (--kv fp8 halves a position's bytes)")};
+                                              std::to_string(need / kMiB) + " MiB a session (the resident slice plus overhead: " +
+                                              std::to_string((need - base) / kMiB) + " MiB over the base); the tail beyond the " +
+                                              std::to_string(kv_res_) + "-cell resident slice streams to RAM" +
+                                              (fp8_ || int8_ ? "" : " (--kv fp8 halves a position's bytes)")};
         }
         ctx_ = want;
         }

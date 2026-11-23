@@ -259,5 +259,7 @@ uint64_t shared_bytes(const Geometry& g, bool drafter);
 /// The share of `session_bytes` the card holds when each attention layer keeps `resident` cells and the cells past
 /// them home in RAM (`--kv-resident`; 0 or `resident >= context`: all of it, as today).
 uint64_t session_device_bytes(const Geometry& g, int64_t context, bool fp8, int64_t resident);
+/// The page-locked RAM bytes a session's streamed tail needs (the dense model's session_host_bytes).
+uint64_t session_host_bytes(const Geometry& g, int64_t context, bool fp8, int64_t resident);
 
 }  // namespace basalt::models::inkling2
