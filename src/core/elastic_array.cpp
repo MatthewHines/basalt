@@ -56,6 +56,11 @@ bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) 
         err = "the array is full";
         return false;
     }
+    // past the host boundary the bytes live in RAM: nothing left for the device to map there
+    if (host_start_ != kNoHost) {
+        if (bytes > host_start_) bytes = host_start_;
+        if (bytes <= backed_) return true;
+    }
     const uint64_t n = growth(bytes);
     const uint64_t want = backed_ + n;
     if (keep_free > 0) {
@@ -81,10 +86,38 @@ bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) 
     return true;
 }
 
+bool ElasticArray::back_host(uint64_t bytes, std::string& err) {
+    if (plain_ || !base_) {
+        err = "host backing needs virtual memory management";
+        return false;
+    }
+    if (bytes <= backed_) return true;
+    if (bytes > reserved_) {
+        err = "the array is full";
+        return false;
+    }
+    if (host_start_ == kNoHost) host_start_ = backed_;
+    const uint64_t kHostPiece = 2ull << 30;   // the driver's single host allocation limit
+    uint64_t at = backed_;
+    while (at < bytes) {
+        const uint64_t n = std::min(kHostPiece, bytes - at);
+        const unsigned long long h = vmm::map_host(base_ + at, n);
+        if (!h) {
+            err = "out of host memory for the streamed range";   // what was mapped before stays backed
+            return false;
+        }
+        cudaMemset(base_ + at, 0, n);
+        extents_.push_back({at, n, h, true});
+        backed_ = at + n;
+        at = backed_;
+    }
+    return true;
+}
+
 void ElasticArray::trim(uint64_t bytes) {
     if (plain_ || !base_ || extents_.empty() || extents_.back().off < bytes) return;
     cudaDeviceSynchronize();
-    while (!extents_.empty() && extents_.back().off >= bytes) {
+    while (!extents_.empty() && !extents_.back().host && extents_.back().off >= bytes) {   // host bytes stay: RAM is not the scarce one
         const Extent& e = extents_.back();
         vmm::unmap(base_ + e.off, e.bytes, e.handle);
         extents_.pop_back();

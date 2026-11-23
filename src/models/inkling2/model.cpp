@@ -87,6 +87,17 @@ uint64_t shared_bytes(const Geometry& g, bool drafter) {
     return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kDecodeRows, kPromptChunk)) : 0);   // PROMPT, DSPARK HOOKS
 }
 
+uint64_t session_device_bytes(const Geometry& g, int64_t context, bool fp8, int64_t resident) {
+    if (resident <= 0 || resident >= context) return session_bytes(g, context, fp8);
+    int global = 0;
+    for (const Visit& v : g.visits)
+        if (!g.swa[(size_t) v.layer]) global += 1;
+    const uint64_t elem = fp8 ? 1 : 2;
+    const uint64_t per_pos = 2ull * kKvHeads * kHeadDim * elem;
+    // the cells past the resident bound home in RAM: the plan charges the card only its share
+    return session_bytes(g, context, fp8) - (uint64_t) global * per_pos * (uint64_t) (context - resident);
+}
+
 InklingModel::InklingModel() = default;
 
 InklingModel::~InklingModel() {
@@ -366,10 +377,21 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
         if (want < 1024 || (g.context_length > 0 && want > g.context_length))
             return fail("--max-context " + std::to_string(want) + " is outside 1,024 .. " + std::to_string(g.context_length));
+        kv_res_ = req.kv_resident;
+        if (kv_res_ < 0) return fail("--kv-resident must be >= 0");
+        if (kv_res_ > 0 && kv_res_ < 1024) return fail("--kv-resident keeps at least 1,024 cells on the card");
+        if (kv_res_ >= want) kv_res_ = 0;   // every cell stays on the card anyway: off
+        if (kv_res_ > 0 && cut_ > 0) return fail("inkling2: --kv-resident is one card; the layer split keeps every cache on its card");
+        if (kv_res_ > 0 && !core::vmm::supported()) return fail("inkling2: --kv-resident needs virtual memory management");
+        if (kv_res_ > 0) elastic_ = true;   // the sessions' full caches become elastic arrays with a host tail
         const uint64_t spare = kCardSpare - vision_modules;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
             return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
+        };
+        const auto bytes_dev = [&](int64_t c) {   // the card's share (DSPARK HOOK: the drafter rides beside it, always resident)
+            return session_device_bytes(g, c, fp8_, kv_res_) +
+                   (dspark_ ? dspark_session_bytes(pack_, c) : 0);
         };
         const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
         if (cut_ > 0) {   // the layer split: each card holds its layers' experts (no spill), checked once they are placed
@@ -401,7 +423,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             for (const LayerWeights& w : layers_) stride.push_back(w.expert_stride);
             uint64_t full = 0;
             for (uint64_t st : stride) full += st * (uint64_t) g.n_expert;
-            const uint64_t want_b = full + bytes_at(want) * n_sess + shared + spare;
+            const uint64_t want_b = full + bytes_dev(want) * n_sess + shared + spare;
             // when some must go: a margin for the tables and maps allocated after the plan and the driver's own rounding
             const uint64_t short_b = want_b > free_b ? want_b - free_b + 128 * kMiB : 0;
             const int64_t keep = req.expert_cache > 0 ? req.expert_cache : -1;
@@ -448,10 +470,10 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const uint64_t avail = free_b > spare + shared ? (free_b - spare - shared) / n_sess : 0;
-        const uint64_t need = bytes_at(want);
+        const uint64_t need = bytes_dev(want);
         if (need > avail) {
-            const uint64_t per = bytes_at(2) - bytes_at(1);
-            const uint64_t base = bytes_at(0);
+            const uint64_t per = bytes_dev(2) - bytes_dev(1);
+            const uint64_t base = bytes_dev(0);
             const int64_t fits = avail > base ? (int64_t) ((avail - base) / per) : 0;
             return {model::Status::Error, "inkling2: --max-context " + std::to_string(want) + " needs " +
                                               std::to_string(need / kMiB) + " MiB a session; about " + std::to_string(fits) +

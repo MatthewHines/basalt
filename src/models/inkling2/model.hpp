@@ -106,6 +106,8 @@ public:
     /// only the positions in use. On with a spill the context made (not --expert-cache) and a context above the elastic
     /// KV's base (core/elastic_kv.hpp).
     bool elastic() const { return elastic_; }
+    /// The cells of K/V each attention layer keeps in VRAM (--kv-resident, per session; 0: all on the card).
+    int64_t kv_resident() const { return kv_res_; }
     /// Copies RAM experts to the card, the most routed first, while `keep_free` bytes stay free; their blob table entries
     /// point at the copies (decode reads them there; a prompt chunk's staging is unchanged). Bytes copied.
     uint64_t promote(uint64_t keep_free);
@@ -216,8 +218,12 @@ private:
     uint8_t* spill_host_ = nullptr;
     // the elastic spill: the RAM experts the most routed first, each one's card copy (null: none)
     bool elastic_ = false;
+<<<<<<< HEAD
     uint64_t reserve_ = 0;
     bool lent_ = false;
+=======
+    int64_t kv_res_ = 0;   // --kv-resident cells per attention layer (0: all on the card)
+>>>>>>> inkling2: kv-resident — stream per-session K/V past N cells from page-locked RAM under unchanged addresses
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
     std::vector<void*> copy_;
     int64_t n_copy_ = 0;
@@ -250,5 +256,8 @@ uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, 
 /// The device bytes every session shares once on a card: the forward's scratch, the prompt path, the drafter's tap (the
 /// first card's).
 uint64_t shared_bytes(const Geometry& g, bool drafter);
+/// The share of `session_bytes` the card holds when each attention layer keeps `resident` cells and the cells past
+/// them home in RAM (`--kv-resident`; 0 or `resident >= context`: all of it, as today).
+uint64_t session_device_bytes(const Geometry& g, int64_t context, bool fp8, int64_t resident);
 
 }  // namespace basalt::models::inkling2
