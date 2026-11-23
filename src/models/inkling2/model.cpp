@@ -396,6 +396,42 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         if (kv_res_ > 0) elastic_ = true;   // the sessions' full caches become elastic arrays with a host tail
         const uint64_t spare = kCardSpare - vision_modules;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
+        // [all experts first] when the session's resident slice cannot hold the asked context, the experts are
+        // never evicted -- the slice shrinks instead and the tail streams in host RAM. This is the only place
+        // bytes_dev is computed from a free-room reading, so it must run before the plan below.
+        if (req.expert_cache <= 0 && kv_res_ == 0) {
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            std::vector<uint64_t> stride;
+            for (const LayerWeights& w : layers_) stride.push_back(w.expert_stride);
+            uint64_t full_e = 0;
+            for (uint64_t st : stride) full_e += st * (uint64_t) g.n_expert;
+            if (full_e + spare >= free_b)
+                return fail("inkling2: the full expert tables (" + std::to_string(full_e >> 20) + " MiB) leave no room for a session even with no KV: --max-context " + std::to_string(want) + " does not fit, free " + std::to_string(free_b >> 20) + " MiB");
+            const uint64_t want_full = full_e + (session_device_bytes(g, want, fp8_, 0) +
+                                                 (dspark_ ? dspark_session_bytes(pack_, want, std::max(kDecodeRows, kPromptChunk)) : 0)) * n_sess + spare;
+            if (want_full > free_b) {
+                int global = 0;
+                for (const Visit& v : g.visits)
+                    if (!g.swa[(size_t) v.layer]) global += 1;
+                const uint64_t elem = fp8_ ? 1 : 2;
+                const uint64_t per_pos = (uint64_t) global * 2ull * kKvHeads * kHeadDim * elem;
+                const uint64_t budget = free_b - spare - full_e;
+                const uint64_t base_cost = (session_device_bytes(g, 0, fp8_, 0) +
+                                            (dspark_ ? dspark_session_bytes(pack_, 0, std::max(kDecodeRows, kPromptChunk)) : 0)) * n_sess;
+                if (budget <= base_cost)
+                    return fail("inkling2: the full expert tables (" + std::to_string(full_e >> 20) + " MiB) leave no room for a session's rings and scratch; free " + std::to_string(budget >> 20) + " MiB");
+                const int64_t fit = (int64_t) ((budget - base_cost) / per_pos);
+                if (fit < 1024)
+                    return fail("inkling2: all experts leave ~" + std::to_string(fit) + " cells of KV a session (need 1,024 minimum); free " + std::to_string(free_b >> 20) + " MiB, the tables take " + std::to_string((full_e + spare) >> 20) + " MiB");
+                kv_res_ = fit < want ? fit : 0;
+                if (kv_res_ > 0) {
+                    elastic_ = true;
+                    basalt::log::info("basalt inkling2", "all experts resident: card holds %lld of %lld cells of --max-context %lld per slot; the tail streams to RAM",
+                                      (long long) kv_res_, (long long) want, (long long) want);
+                }
+            }
+        }
         if (kv_res_ > 0)
             basalt::log::info("basalt inkling2", "K/V streaming: %lld of %lld cells per layer in VRAM, %.2f GiB in page-locked RAM per slot (the drafter's caches stay on the card)",
                               (long long) kv_res_, (long long) want, (double) session_host_bytes(g, want, fp8_, kv_res_) / (double) kGiB);
