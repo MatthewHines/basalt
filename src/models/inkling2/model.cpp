@@ -408,7 +408,6 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             uint64_t extra = 0;   // the per-layer overheads beyond the table: the prompt-path pad (`past`)
                                 // and the device blob_table (n_expert entries, 8 bytes each)
             for (size_t li = 0; li < layers_.size(); ++li) {
-                const LayerWeights& w = layers_[li];
                 const ExpertLayer& el = pack_.experts[li];
                 extra += std::max(prefill::mmq::read_past_bytes(el.gu_type, g.n_embd),
                                    prefill::mmq::read_past_bytes(el.d_type, g.n_ff_exp)) +

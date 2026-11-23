@@ -178,12 +178,9 @@ private:
     uint8_t* spill_host_ = nullptr;
     // the elastic spill: the RAM experts the most routed first, each one's card copy (null: none)
     bool elastic_ = false;
-<<<<<<< HEAD
     uint64_t reserve_ = 0;
     bool lent_ = false;
-=======
     int64_t kv_res_ = 0;   // --kv-resident cells per attention layer (0: all on the card)
->>>>>>> inkling2: kv-resident — stream per-session K/V past N cells from page-locked RAM under unchanged addresses
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
     std::vector<void*> copy_;
     int64_t n_copy_ = 0;
