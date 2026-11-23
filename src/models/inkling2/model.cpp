@@ -394,7 +394,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         if (kv_res_ > 0 && cut_ > 0) return fail("inkling2: --kv-resident is one card; the layer split keeps every cache on its card");
         if (kv_res_ > 0 && !core::vmm::supported()) return fail("inkling2: --kv-resident needs virtual memory management");
         if (kv_res_ > 0) elastic_ = true;   // the sessions' full caches become elastic arrays with a host tail
-        const uint64_t spare = kCardSpare - vision_modules;   // [vision]
+        const uint64_t spare = std::max<uint64_t>(kCardSpare, (uint64_t) std::max(req.vram_reserve_mib, 0) << 20) - vision_modules;   // [vision] the desktop's floor rides in the plan too, as qwen35's does
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         // [all experts first] when the session's resident slice cannot hold the asked context, the experts are
         // never evicted -- the slice shrinks instead and the tail streams in host RAM. This is the only place
@@ -405,20 +405,34 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             std::vector<uint64_t> stride;
             for (const LayerWeights& w : layers_) stride.push_back(w.expert_stride);
             uint64_t full_e = 0;
-            for (uint64_t st : stride) full_e += st * (uint64_t) g.n_expert;
+            uint64_t extra = 0;   // the per-layer overheads beyond the table: the prompt-path pad (`past`)
+                                // and the device blob_table (n_expert entries, 8 bytes each)
+            for (size_t li = 0; li < layers_.size(); ++li) {
+                const LayerWeights& w = layers_[li];
+                const ExpertLayer& el = pack_.experts[li];
+                extra += std::max(prefill::mmq::read_past_bytes(el.gu_type, g.n_embd),
+                                   prefill::mmq::read_past_bytes(el.d_type, g.n_ff_exp)) +
+                        (uint64_t) g.n_expert * 8;
+            }
+            for (size_t li = 0; li < layers_.size(); ++li) full_e += stride[li] * (uint64_t) g.n_expert;
+            full_e += extra;
             if (full_e + spare >= free_b)
                 return fail("inkling2: the full expert tables (" + std::to_string(full_e >> 20) + " MiB) leave no room for a session even with no KV: --max-context " + std::to_string(want) + " does not fit, free " + std::to_string(free_b >> 20) + " MiB");
+            const uint64_t shared0 = shared_bytes(g, dspark_ != nullptr);   // the scratch every slot shares, charged once
             const uint64_t want_full = full_e + (session_device_bytes(g, want, fp8_, 0) +
-                                                 (dspark_ ? dspark_session_bytes(pack_, want, std::max(kDecodeRows, kPromptChunk)) : 0)) * n_sess + spare;
-            if (want_full > free_b) {
+                                                 (dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess + shared0 + spare;
+            // the same margin the spill plan keeps: the driver's rounding on the per-layer allocations lands after the plan.
+            // Without it the check below rejects a plan this block made — an exact fit is a coin flip, not a fit.
+            const uint64_t plan_margin = 128 * kMiB;
+            if (want_full + plan_margin > free_b) {
                 int global = 0;
                 for (const Visit& v : g.visits)
                     if (!g.swa[(size_t) v.layer]) global += 1;
                 const uint64_t elem = fp8_ ? 1 : 2;
                 const uint64_t per_pos = (uint64_t) global * 2ull * kKvHeads * kHeadDim * elem;
-                const uint64_t budget = free_b - spare - full_e;
+                const uint64_t budget = free_b - spare - shared0 - full_e - plan_margin;
                 const uint64_t base_cost = (session_device_bytes(g, 0, fp8_, 0) +
-                                            (dspark_ ? dspark_session_bytes(pack_, 0, std::max(kDecodeRows, kPromptChunk)) : 0)) * n_sess;
+                                            (dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess;
                 if (budget <= base_cost)
                     return fail("inkling2: the full expert tables (" + std::to_string(full_e >> 20) + " MiB) leave no room for a session's rings and scratch; free " + std::to_string(budget >> 20) + " MiB");
                 const int64_t fit = (int64_t) ((budget - base_cost) / per_pos);
