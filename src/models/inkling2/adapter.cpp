@@ -59,6 +59,10 @@ public:
             o.diag_split_at = std::atoi(args.next("--diag-split-at"));
             return true;
         }
+        if (a == "--kv-resident") {
+            o.kv_resident = std::atoll(args.next("--kv-resident"));
+            return true;
+        }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK
     }
 

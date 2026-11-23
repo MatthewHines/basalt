@@ -26,6 +26,10 @@ void release_range(uint8_t* va, uint64_t bytes);
 /// Backs `[va, va + bytes)` with a new physical allocation on the current device, readable and writable by it.
 /// Returns the handle (0 on failure: nothing is left mapped).
 unsigned long long map(uint8_t* va, uint64_t bytes);
+/// Backs `[va, va + bytes)` with a new physical allocation in host NUMA memory: the bytes live in RAM and both the
+/// CPU and the current device reach them at `va` (the GPU over the bus).  `va` and `bytes` must fit the host
+/// allocation's granularity.  Returns the handle (0 on failure: nothing is left mapped).
+unsigned long long map_host(uint8_t* va, uint64_t bytes);
 /// Unmaps what `map` mapped there and frees its physical memory.  The caller has made sure no work reads it.
 bool unmap(uint8_t* va, uint64_t bytes, unsigned long long handle);
 /// A physical allocation of `bytes` on the current device, mapped nowhere yet (0 on failure): one backing that

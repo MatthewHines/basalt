@@ -291,14 +291,17 @@ public:
             c.ring = g_.swa[(size_t) v.layer];
             c.cap = c.ring ? (int64_t) g_.window + kMaxRows : ctx;
             const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * kHeadDim * elem;
-            if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
+            if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first cells backed
+                                            // (--kv-resident: the base is the resident bound and the tail homes in RAM)
+                const int64_t base_cells = m_.kv_resident() > 0 ? m_.kv_resident() : core::kElasticKvBase;
                 for (int j = 0; j < 2; ++j) {
                     auto a = std::make_unique<core::ElasticArray>();
-                    if (ok && (!a->open(bytes, err) || !a->ensure(cell_bytes() * (uint64_t) core::kElasticKvBase, 0, err))) ok = false;
+                    if (ok && (!a->open(bytes, err) || !a->ensure(cell_bytes() * (uint64_t) base_cells, 0, err) ||
+                               (m_.kv_resident() > 0 && !a->back_host(bytes, err)))) ok = false;
                     (j ? c.v : c.k) = a->data();
                     elastic_.push_back(std::move(a));
                 }
-                backed_ = core::kElasticKvBase;
+                backed_ = m_.kv_resident() > 0 ? m_.context() : core::kElasticKvBase;
             } else {
                 c.k = alloc(bytes, ok);
                 c.v = alloc(bytes, ok);
