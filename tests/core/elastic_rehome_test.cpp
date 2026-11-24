@@ -198,21 +198,14 @@ static void test_t4() {
     std::string err;
     auto arr = std::unique_ptr<basalt::core::ElasticArray>(new basalt::core::ElasticArray);
     if (!arr->open(4 * g_gran, err)) { mark(false, "T4: open"); return; }
-    // back_host the full range → host tail is host-backed, host_start_ == 0
     if (!arr->back_host(2 * g_gran, err)) { mark(false, "T4: back_host"); return; }
-    // promote granule 1 (chunk 0) → device; granule 2 stays host
     auto r = arr->rehome(0, g_gran, 0);
-    mark(r.moved == 1, "T4: promote committed");
-    // hole: granule 1 is device, granule 2 is host → ensure past the hole clamps
-    std::string e2;
-    size_t before = arr->backed();
-    if (!arr->ensure(2 * g_gran, 0, e2)) {
-        // refusal is acceptable iff it is the clamp — check reason/clamp honestly
-        mark(e2.empty() || e2.find("full") != std::string::npos ||
-             arr->backed() == before, "T4: clamp or refusal is coherent");
-    }
-    // the backed range must never exceed the host boundary
-    mark(arr->backed() <= 2 * g_gran, "T4: backed never exceeds the host boundary");
+    mark(r.moved == 1, "T4: promote committed (device at 0, host at granule 2, hole ahead)");
+    bool ok = arr->ensure(4 * g_gran, 0, err);
+    mark(arr->backed() == 2 * g_gran, "T4: growth clamps at the host boundary (hole respected)");
+    mark(arr->host_start() == g_gran, "T4: host boundary unmoved by the clamped ensure");
+    mark(ok || !err.empty(), "T4: refusal (if any) carries a reason");
+
 }
 
 // T5: ledger after-act — every public op that emits a line emits exactly one.
@@ -388,6 +381,9 @@ static void row_pa() {
     std::string err;
     auto arr = make_promote_fixture(err);
     if (!arr) { std::printf("T7 Pa: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    std::memcpy(arr->data() + g_gran, pattern.data(), g_gran);   // T1 idiom (host-backed granule)
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::Create);
@@ -398,6 +394,7 @@ static void row_pa() {
     mark(arr->scratch_live_maps() == 0, "T7 Pa: scratch maps 0");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Pa: handles delta 0");
     mark(ledger_count() == 1, "T7 Pa: ledger line captured");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pa: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pa: I1/I2 hold");
 }
 
@@ -406,6 +403,9 @@ static void row_pb_map() {
     std::string err;
     auto arr = make_promote_fixture(err);
     if (!arr) { std::printf("T7 Pb-map: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    std::memcpy(arr->data() + g_gran, pattern.data(), g_gran);   // T1 idiom (host-backed granule)
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::Map);
@@ -414,6 +414,7 @@ static void row_pb_map() {
     mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Pb-map: S0");
     mark(arr->scratch_live_maps() == 0, "T7 Pb-map: scratch 0");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Pb-map: handles delta 0");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pb-map: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pb-map: I1/I2 hold");
 }
 
@@ -422,6 +423,9 @@ static void row_pb_access_unmap_ok() {
     std::string err;
     auto arr = make_promote_fixture(err);
     if (!arr) { std::printf("T7 Pb-ac-ok: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    std::memcpy(arr->data() + g_gran, pattern.data(), g_gran);   // T1 idiom (host-backed granule)
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::SetAccess);
@@ -430,6 +434,7 @@ static void row_pb_access_unmap_ok() {
     mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Pb-ac-ok: S0");
     mark(arr->scratch_live_maps() == 0, "T7 Pb-ac-ok: scratch 0 (unmap ok)");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Pb-ac-ok: handles delta 0");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pb-ac-ok: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pb-ac-ok: I1/I2 hold");
 }
 
@@ -438,6 +443,9 @@ static void row_pb_access_unmap_fails() {
     std::string err;
     auto arr = make_promote_fixture(err);
     if (!arr) { std::printf("T7 Pb-ac-fail: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    std::memcpy(arr->data() + g_gran, pattern.data(), g_gran);   // T1 idiom (host-backed granule)
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::SetAccess);  // step (b) access fails (#1)
@@ -453,6 +461,7 @@ static void row_pb_access_unmap_fails() {
     if (stuck.size() == 1)
         mark(stuck[0].va == arr->data() + g_gran || stuck[0].va != nullptr,
              "T7 Pb-ac-fail: stuck entry owns a VA");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pb-ac-fail: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pb-ac-fail: I1/I2 hold");
 }
 
@@ -461,6 +470,9 @@ static void row_pc_copy_ok() {
     std::string err;
     auto arr = make_promote_fixture(err);
     if (!arr) { std::printf("T7 Pc-ok: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    std::memcpy(arr->data() + g_gran, pattern.data(), g_gran);   // T1 idiom (host-backed granule)
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::CopyH2D);
@@ -468,6 +480,8 @@ static void row_pc_copy_ok() {
     mark(r.moved == 0, "T7 Pc-ok: not committed");
     mark(arr->scratch_live_maps() == 0, "T7 Pc-ok: scratch 0 (unmap ok)");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Pc-ok: handles delta 0");
+    mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Pc-ok: S0 (extent unchanged)");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pc-ok: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pc-ok: I1/I2 hold");
 }
 
@@ -475,6 +489,9 @@ static void row_pc_copy_unmap_fails() {
     std::string err;
     auto arr = make_promote_fixture(err);
     if (!arr) { std::printf("T7 Pc-fail: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    std::memcpy(arr->data() + g_gran, pattern.data(), g_gran);   // T1 idiom (host-backed granule)
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::CopyH2D);
@@ -484,6 +501,8 @@ static void row_pc_copy_unmap_fails() {
     mark(r.moved == 0, "T7 Pc-fail: not committed");
     mark(arr->scratch_live_maps() == 1, "T7 Pc-fail: scratch 1 (w_d_live set)");
     mark_eq(arr->live_handle_count(), lh_before + 1, "T7 Pc-fail: handles delta +1 (stuck)");
+    mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Pc-fail: S0 (extent unchanged)");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pc-fail: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pc-fail: I1/I2 hold");
 }
 
@@ -492,6 +511,9 @@ static void row_pd() {
     std::string err;
     auto arr = make_promote_fixture(err);
     if (!arr) { std::printf("T7 Pd: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    std::memcpy(arr->data() + g_gran, pattern.data(), g_gran);   // T1 idiom (host-backed granule)
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::UnmapOnly);  // (d) scratch unmap fails twice
@@ -501,6 +523,7 @@ static void row_pd() {
     mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S3, "T7 Pd: extent S3");
     mark(arr->scratch_live_maps() == 1, "T7 Pd: scratch 1 (w_d_live set)");
     mark_eq(arr->live_handle_count(), lh_before + 1, "T7 Pd: handles delta +1 (pending)");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pd: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pd: I1/I2 hold");
 }
 
@@ -509,6 +532,9 @@ static void row_pe() {
     std::string err;
     auto arr = make_promote_fixture(err);
     if (!arr) { std::printf("T7 Pe: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    std::memcpy(arr->data() + g_gran, pattern.data(), g_gran);   // T1 idiom (host-backed granule)
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     // step (d) scratch unmap must SUCCEED: only arm the MAIN unmap (2 attempts).
@@ -518,6 +544,7 @@ static void row_pe() {
     mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Pe: S0");
     mark(arr->scratch_live_maps() == 0, "T7 Pe: scratch 0");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Pe: handles delta 0");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pe: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pe: I1/I2 hold");
 }
 
@@ -610,6 +637,9 @@ static void row_pg() {
     std::string err;
     auto arr = make_promote_fixture(err);
     if (!arr) { std::printf("T7 Pg: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    std::memcpy(arr->data() + g_gran, pattern.data(), g_gran);   // T1 idiom (host-backed granule)
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::Release);
@@ -621,6 +651,8 @@ static void row_pg() {
     auto stuck = arr->stuck_entries();
     mark(stuck.size() == 1, "T7 Pg: one release-pending stuck entry");
     if (!stuck.empty()) mark(stuck[0].va == nullptr, "T7 Pg: release-pending entry has null VA");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pg: bytes intact");
+    mark(arr->host_start() == basalt::core::ElasticArray::kNoHost, "T7 Pg: flip stands (no host extent left)");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pg: I1/I2 hold");
 }
 
@@ -646,6 +678,10 @@ static void row_da() {
     std::string err;
     auto arr = make_demote_fixture(err);
     if (!arr) { std::printf("T7 Da: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    if (!basalt::core::vmm::copy_h2d(arr->data() + g_gran, pattern.data(), g_gran))
+        { mark(false, "T7 Da: pattern write"); return; }
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::CreateHost);
@@ -654,6 +690,7 @@ static void row_da() {
     mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Da: S0");
     mark(arr->scratch_live_maps() == 0, "T7 Da: scratch 0");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Da: handles delta 0");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Da: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Da: I1/I2 hold");
 }
 
@@ -661,6 +698,10 @@ static void row_db_map() {
     std::string err;
     auto arr = make_demote_fixture(err);
     if (!arr) { std::printf("T7 Db-map: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    if (!basalt::core::vmm::copy_h2d(arr->data() + g_gran, pattern.data(), g_gran))
+        { mark(false, "T7 Db-map: pattern write"); return; }
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::Map);
@@ -669,6 +710,7 @@ static void row_db_map() {
     mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Db-map: S0");
     mark(arr->scratch_live_maps() == 0, "T7 Db-map: scratch 0");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Db-map: handles delta 0");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Db-map: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Db-map: I1/I2 hold");
 }
 
@@ -676,6 +718,10 @@ static void row_db_access_unmap_ok() {
     std::string err;
     auto arr = make_demote_fixture(err);
     if (!arr) { std::printf("T7 Db-ac-ok: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    if (!basalt::core::vmm::copy_h2d(arr->data() + g_gran, pattern.data(), g_gran))
+        { mark(false, "T7 Db-ac-ok: pattern write"); return; }
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::SetAccess);
@@ -683,6 +729,8 @@ static void row_db_access_unmap_ok() {
     mark(r.moved == 0, "T7 Db-ac-ok: not committed");
     mark(arr->scratch_live_maps() == 0, "T7 Db-ac-ok: scratch 0 (unmap ok)");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Db-ac-ok: handles delta 0");
+    mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Db-ac-ok: S0 (extent unchanged)");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Db-ac-ok: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Db-ac-ok: I1/I2 hold");
 }
 
@@ -690,6 +738,10 @@ static void row_db_access_unmap_fails() {
     std::string err;
     auto arr = make_demote_fixture(err);
     if (!arr) { std::printf("T7 Db-ac-fail: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    if (!basalt::core::vmm::copy_h2d(arr->data() + g_gran, pattern.data(), g_gran))
+        { mark(false, "T7 Db-ac-fail: pattern write"); return; }
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::SetAccess);  // step (b) access fails (#1)
@@ -699,6 +751,8 @@ static void row_db_access_unmap_fails() {
     mark(r.moved == 0, "T7 Db-ac-fail: not committed");
     mark(arr->scratch_live_maps() == 1, "T7 Db-ac-fail: scratch 1 (w_h_live set)");
     mark_eq(arr->live_handle_count(), lh_before + 1, "T7 Db-ac-fail: handles delta +1");
+    mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Db-ac-fail: S0 (extent unchanged)");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Db-ac-fail: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Db-ac-fail: I1/I2 hold");
 }
 
@@ -706,6 +760,10 @@ static void row_dc_copy_ok() {
     std::string err;
     auto arr = make_demote_fixture(err);
     if (!arr) { std::printf("T7 Dc-ok: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    if (!basalt::core::vmm::copy_h2d(arr->data() + g_gran, pattern.data(), g_gran))
+        { mark(false, "T7 Dc-ok: pattern write"); return; }
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::CopyD2H);
@@ -713,6 +771,8 @@ static void row_dc_copy_ok() {
     mark(r.moved == 0, "T7 Dc-ok: not committed");
     mark(arr->scratch_live_maps() == 0, "T7 Dc-ok: scratch 0 (unmap ok)");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Dc-ok: handles delta 0");
+    mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Dc-ok: S0 (extent unchanged)");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Dc-ok: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Dc-ok: I1/I2 hold");
 }
 
@@ -720,6 +780,10 @@ static void row_dc_copy_unmap_fails() {
     std::string err;
     auto arr = make_demote_fixture(err);
     if (!arr) { std::printf("T7 Dc-fail: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    if (!basalt::core::vmm::copy_h2d(arr->data() + g_gran, pattern.data(), g_gran))
+        { mark(false, "T7 Dc-fail: pattern write"); return; }
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::CopyD2H);
@@ -729,6 +793,8 @@ static void row_dc_copy_unmap_fails() {
     mark(r.moved == 0, "T7 Dc-fail: not committed");
     mark(arr->scratch_live_maps() == 1, "T7 Dc-fail: scratch 1 (w_h_live set)");
     mark_eq(arr->live_handle_count(), lh_before + 1, "T7 Dc-fail: handles delta +1");
+    mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Dc-fail: S0 (extent unchanged)");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Dc-fail: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Dc-fail: I1/I2 hold");
 }
 
@@ -736,6 +802,10 @@ static void row_dd() {
     std::string err;
     auto arr = make_demote_fixture(err);
     if (!arr) { std::printf("T7 Dd: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    if (!basalt::core::vmm::copy_h2d(arr->data() + g_gran, pattern.data(), g_gran))
+        { mark(false, "T7 Dd: pattern write"); return; }
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::UnmapOnly);
@@ -745,6 +815,7 @@ static void row_dd() {
     mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S3, "T7 Dd: extent S3");
     mark(arr->scratch_live_maps() == 1, "T7 Dd: scratch 1 (w_h_live set)");
     mark_eq(arr->live_handle_count(), lh_before + 1, "T7 Dd: handles delta +1 (pending)");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Dd: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Dd: I1/I2 hold");
 }
 
@@ -752,6 +823,10 @@ static void row_de() {
     std::string err;
     auto arr = make_demote_fixture(err);
     if (!arr) { std::printf("T7 De: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    if (!basalt::core::vmm::copy_h2d(arr->data() + g_gran, pattern.data(), g_gran))
+        { mark(false, "T7 De: pattern write"); return; }
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_after(basalt::core::vmm::FailOp::UnmapOnly, 1, 2);  // MAIN unmap fails twice (step d passed)
@@ -760,6 +835,7 @@ static void row_de() {
     mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 De: S0");
     mark(arr->scratch_live_maps() == 0, "T7 De: scratch 0");
     mark_eq(arr->live_handle_count(), lh_before, "T7 De: handles delta 0");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 De: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 De: I1/I2 hold");
 }
 
@@ -905,6 +981,10 @@ static void row_dg() {
     std::string err;
     auto arr = make_demote_fixture(err);
     if (!arr) { std::printf("T7 Dg: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    if (!basalt::core::vmm::copy_h2d(arr->data() + g_gran, pattern.data(), g_gran))
+        { mark(false, "T7 Dg: pattern write"); return; }
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_next(basalt::core::vmm::FailOp::Release);
@@ -916,6 +996,8 @@ static void row_dg() {
     auto stuck = arr->stuck_entries();
     mark(stuck.size() == 1, "T7 Dg: one release-pending stuck entry");
     if (!stuck.empty()) mark(stuck[0].va == nullptr, "T7 Dg: release-pending entry has null VA");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Dg: bytes intact");
+    mark(arr->host_start() == 0, "T7 Dg: flip stands (host starts at 0)");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Dg: I1/I2 hold");
 }
 

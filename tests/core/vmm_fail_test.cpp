@@ -172,9 +172,9 @@ int main() {
     handle = create(g);
     check(handle != 0, "create handle");
     fail_next(FailOp::Map);
-    check(map_handle(va, g, handle) == false, "armed composed map returns false");
+    check(map_handle(va, g, handle) == MapOutcome::MapFail, "armed composed map yields MapFail");
     check(!fail_armed(FailOp::Map), "composed map arm consumed");
-    check(map_handle(va, g, handle) == true, "real composed map succeeds (nothing left)");
+    check(map_handle(va, g, handle) == MapOutcome::Ok, "real composed map succeeds (nothing left)");
     check(unmap(va, g, handle), "composed map unmap succeeds");
     release_range(va, g);
 
@@ -184,9 +184,24 @@ int main() {
     handle = create(g);
     check(handle != 0, "create handle");
     fail_next(FailOp::SetAccess);
-    check(map_handle(va, g, handle) == false, "armed composed set-access returns false");
+    check(map_handle(va, g, handle) == MapOutcome::AccessFail, "armed composed set-access yields AccessFail");
     check(!fail_armed(FailOp::SetAccess), "composed set-access arm consumed");
     check(unmap(va, g, handle), "the S4b-generator handle stays mapped (unmap succeeds)");
+    release_range(va, g);
+
+    // --- shim: positional fail_after + skip-aware peek (review F4) ------------
+    va = reserve(g);
+    check(va != nullptr, "reserve");
+    handle = create(g);
+    check(handle != 0, "create handle");
+    fail_after(FailOp::Map, 1, 1);
+    check(!fail_armed(FailOp::Map), "peek is skip-aware: next call will pass");
+    check(map_handle(va, g, handle) == MapOutcome::Ok, "fail_after: the skipped call really maps");
+    check(unmap_only(va, g), "cleanup the skipped mapping");
+    check(fail_armed(FailOp::Map), "arm is now the next call");
+    check(map_handle(va, g, handle) == MapOutcome::MapFail, "fail_after: the armed call fails");
+    check(!fail_armed(FailOp::Map), "arm consumed exactly once");
+    release(handle);
     release_range(va, g);
 
     // --- shim: unmap, no-op on fail ----------------------------------------
@@ -278,9 +293,9 @@ int main() {
             } else {
                 const auto h1 = handle;
                 fail_next(FailOp::Map);
-                check(map_host_handle(h_va, bytes, h1) == false, "armed map_host_handle returns false");
+                check(map_host_handle(h_va, bytes, h1) == MapOutcome::MapFail, "armed map_host_handle yields MapFail");
                 check(!fail_armed(FailOp::Map), "host map arm consumed");
-                check(map_host_handle(h_va, bytes, h1) == true, "real map_host_handle succeeds");
+                check(map_host_handle(h_va, bytes, h1) == MapOutcome::Ok, "real map_host_handle succeeds");
                 check(set_access_host(h_va, bytes) == true, "host set_access succeeds");
                 check(unmap(h_va, bytes, h1), "cleanup unmap (host handle)");  // h1 released by unmap
 
@@ -290,7 +305,7 @@ int main() {
                 if (handle != 0) {
                     const auto h2 = handle;
                     fail_next(FailOp::SetAccess);
-                    check(map_host_handle(h_va, bytes, h2) == false, "armed composed host set-access returns false");
+                    check(map_host_handle(h_va, bytes, h2) == MapOutcome::AccessFail, "armed composed host set-access yields AccessFail");
                     check(!fail_armed(FailOp::SetAccess), "host composed set-access arm consumed");
                     check(unmap(h_va, bytes, h2), "the S4b-generator host handle stays mapped (unmap succeeds)");
                 }
