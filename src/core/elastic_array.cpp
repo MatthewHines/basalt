@@ -44,14 +44,6 @@ bool unmap_with_retry(uint8_t* va, uint64_t bytes) {
     return vmm::unmap_only(va, bytes) || vmm::unmap_only(va, bytes);
 }
 
-// Composed-map outcome, disambiguated when the shim may have consumed an arm: 0 = ok, 1 = map failed
-// (nothing mapped), 2 = set-access failed (handle stayed mapped). Peek the arms immediately BEFORE the call.
-int composed_map_result(bool ok, bool map_armed, bool access_armed) {
-    if (ok) return 0;
-    if (map_armed) return 1;
-    if (access_armed) return 2;
-    return 1;
-}
 
 std::string reason_piece(const char* tag, uint64_t index, uint64_t moved) {
     return std::string(tag) + " at piece " + std::to_string(index + 1) + "; moved " + std::to_string(moved);
@@ -184,9 +176,16 @@ void ElasticArray::repair_sweep() {
         Extent& e = it->second;
         if (e.state != ExtentState::S4) continue;
         uint8_t* va = base_ + e.off;
-        const bool ok = e.host ? vmm::map_host_handle(va, e.bytes, e.handle)
-                                : vmm::map_handle(va, e.bytes, e.handle);
-        if (!ok) {
+        const vmm::MapOutcome outcome = e.host ? vmm::map_host_handle(va, e.bytes, e.handle)
+                                               : vmm::map_handle(va, e.bytes, e.handle);
+        if (outcome == vmm::MapOutcome::AccessFail) {
+            // Mapped without access is exactly S4b: stage 3 of the NEXT sweep re-runs SetAccess.
+            e.state = ExtentState::S4b;
+            basalt::log::warn("basalt memory", "repair: S4 extent at %llu mapped, access pending (S4b)",
+                              (unsigned long long) e.off);
+            continue;
+        }
+        if (outcome == vmm::MapOutcome::MapFail) {
             basalt::log::warn("basalt memory", "repair: S4 extent at %llu still broken",
                               (unsigned long long) e.off);
             continue;
@@ -196,18 +195,9 @@ void ElasticArray::repair_sweep() {
         e.pending = 0;
         e.staging = 0;
 
-        // Release any OTHER owned unmapped handle (L3; SKIP handles carried in the stuck list).
-        std::set<uint64_t> stuck_handles;
-        for (const auto& s : stuck_) stuck_handles.insert(s.handle);
-        for (auto& [o, other] : extents_) {
-            if (o == e.off) continue;
-            if (other.pending && !stuck_handles.count(other.pending)) {
-                release_ok(other.pending);
-                other.pending = 0;
-                other.staging = 0;
-                other.state = ExtentState::S0;
-            }
-        }
+        // No other-extent cleanup here: a live pending is, by definition, an S3 scratch mapping
+        // (stage 2 owns its unmap->release chain) — releasing it here would break L3 and mark it
+        // S3-as-S0. Stage-4 repair touches exactly the extent being healed.
     }
 
     if (!i2_ok()) {
@@ -224,16 +214,23 @@ ElasticArray::~ElasticArray() {
         return;
     }
     cudaDeviceSynchronize();
+    // Teardown order (L3): every mapping goes first, then every handle — never release mapped.
     for (const auto& [off, e] : extents_) {
         if (e.handle) vmm::unmap_only(base_ + e.off, e.bytes);
-        if (e.pending) vmm::release(e.pending);
+    }
+    for (const auto& [off, e] : extents_) {
+        if (e.pending) vmm::unmap_only(reinterpret_cast<uint8_t*>(e.staging == 1 ? scratch_d_va_ : scratch_h_va_), e.bytes);
     }
     if (w_d_live_) vmm::unmap_only(reinterpret_cast<uint8_t*>(scratch_d_va_), gran_);
     if (w_h_live_) vmm::unmap_only(reinterpret_cast<uint8_t*>(scratch_h_va_), gran_);
     for (const auto& s : stuck_) {
         if (s.va && s.kind == 0) vmm::unmap_only(s.va, s.bytes);
-        vmm::release(s.handle);
     }
+    for (const auto& [off, e] : extents_) {
+        if (e.handle) vmm::release(e.handle);
+        if (e.pending) vmm::release(e.pending);
+    }
+    for (const auto& s : stuck_) vmm::release(s.handle);
     vmm::release_range(base_, reserved_);
 }
 
@@ -539,21 +536,18 @@ MoveResult ElasticArray::rehome(uint64_t off, uint64_t bytes, uint64_t keep_free
         }
 
         // (b) Map device handle -> W_d; SetAccess {DEVICE rw}
-        const bool map_armed = vmm::fail_armed(vmm::FailOp::Map);
-        const bool access_armed = vmm::fail_armed(vmm::FailOp::SetAccess);
-        const bool ok = vmm::map_handle(reinterpret_cast<uint8_t*>(scratch_d_va_), gran, dev_h);
-        const int why_b = composed_map_result(ok, map_armed, access_armed);
-        if (why_b == 1) {
-            release_ok(dev_h);
+        const vmm::MapOutcome ok_b = vmm::map_handle(reinterpret_cast<uint8_t*>(scratch_d_va_), gran, dev_h);
+        if (ok_b == vmm::MapOutcome::MapFail) {
+            if (!release_ok(dev_h)) stuck_.push_back({dev_h, nullptr, gran, 1});
             r.moved = moved;
             r.reason = reason_piece("map failed", chunk_idx, moved);
             fail_step = "b";
             break;
         }
-        if (why_b == 2) {
+        if (ok_b == vmm::MapOutcome::AccessFail) {
             if (unmap_with_retry(reinterpret_cast<uint8_t*>(scratch_d_va_), gran)) {
                 w_d_live_ = false;
-                release_ok(dev_h);
+                if (!release_ok(dev_h)) stuck_.push_back({dev_h, nullptr, gran, 1});
             } else {
                 w_d_live_ = true;
                 stuck_.push_back({dev_h, reinterpret_cast<uint8_t*>(scratch_d_va_), gran, 0});
@@ -569,7 +563,7 @@ MoveResult ElasticArray::rehome(uint64_t off, uint64_t bytes, uint64_t keep_free
         if (!vmm::copy_h2d(reinterpret_cast<uint8_t*>(scratch_d_va_), base_ + chunk_off, gran)) {
             if (unmap_with_retry(reinterpret_cast<uint8_t*>(scratch_d_va_), gran)) {
                 w_d_live_ = false;
-                release_ok(dev_h);
+                if (!release_ok(dev_h)) stuck_.push_back({dev_h, nullptr, gran, 1});
             } else {
                 stuck_.push_back({dev_h, reinterpret_cast<uint8_t*>(scratch_d_va_), gran, 0});
             }
@@ -595,7 +589,7 @@ MoveResult ElasticArray::rehome(uint64_t off, uint64_t bytes, uint64_t keep_free
         // (e) Unmap host from MAIN
         if (!unmap_with_retry(base_ + chunk_off, gran)) {
             // NOTHING CHANGED (L2b): host stays live; device released (unmapped — L3). No stuck entry.
-            release_ok(dev_h);
+            if (!release_ok(dev_h)) stuck_.push_back({dev_h, nullptr, gran, 1});
             r.moved = moved;
             r.reason = "unmap refused; nothing moved beyond chunk " + std::to_string(chunk_idx + 1);
             fail_step = "e";
@@ -603,26 +597,20 @@ MoveResult ElasticArray::rehome(uint64_t off, uint64_t bytes, uint64_t keep_free
         }
 
         // (f) Map device handle onto MAIN; SetAccess {DEVICE rw}
-        const bool f_map_armed = vmm::fail_armed(vmm::FailOp::Map);
-        const bool f_access_armed = vmm::fail_armed(vmm::FailOp::SetAccess);
-        const bool fok = vmm::map_handle(base_ + chunk_off, gran, dev_h);
-        const int fwhy = composed_map_result(fok, f_map_armed, f_access_armed);
-        if (fwhy == 1) {
+        const vmm::MapOutcome fo = vmm::map_handle(base_ + chunk_off, gran, dev_h);
+        if (fo == vmm::MapOutcome::MapFail) {
             // map fail: RESTORE FIRST — map host back onto MAIN + SetAccess {HOST_NUMA rw, DEVICE rw}
-            const bool r_map_armed = vmm::fail_armed(vmm::FailOp::Map);
-            const bool r_access_armed = vmm::fail_armed(vmm::FailOp::SetAccess);
-            const bool rok = vmm::map_host_handle(base_ + chunk_off, gran, host_handle);
-            const int rwhy = composed_map_result(rok, r_map_armed, r_access_armed);
+            const vmm::MapOutcome ro = vmm::map_host_handle(base_ + chunk_off, gran, host_handle);
             // release device (unmapped since d — L3; release anyway even if restore map failed)
-            release_ok(dev_h);
-            if (rwhy == 1) {
+            if (!release_ok(dev_h)) stuck_.push_back({dev_h, nullptr, gran, 1});
+            if (ro == vmm::MapOutcome::MapFail) {
                 // double-fault: S4 — bytes-holder = HOST handle (named); device released
                 e->state = ExtentState::S4;
                 e->host = true;
                 e->handle = host_handle;
                 e->pending = 0;
                 e->staging = 0;
-            } else if (rwhy == 2) {
+            } else if (ro == vmm::MapOutcome::AccessFail) {
                 // restore SetAccess fail: S4b — extent backing = HOST
                 e->state = ExtentState::S4b;
                 e->host = true;
@@ -642,20 +630,17 @@ MoveResult ElasticArray::rehome(uint64_t off, uint64_t bytes, uint64_t keep_free
             fail_step = "f";
             break;
         }
-        if (fwhy == 2) {
+        if (fo == vmm::MapOutcome::AccessFail) {
             // SetAccess fail: device at MAIN, no access — unmap it.
             if (unmap_with_retry(base_ + chunk_off, gran)) {
                 // unmap ok: restore host (map + canonical host desc)
-                const bool r_map_armed = vmm::fail_armed(vmm::FailOp::Map);
-                const bool r_access_armed = vmm::fail_armed(vmm::FailOp::SetAccess);
-                const bool rok = vmm::map_host_handle(base_ + chunk_off, gran, host_handle);
-                const int rwhy = composed_map_result(rok, r_map_armed, r_access_armed);
-                release_ok(dev_h);
-                if (rwhy == 1) {
+                const vmm::MapOutcome ro = vmm::map_host_handle(base_ + chunk_off, gran, host_handle);
+                if (!release_ok(dev_h)) stuck_.push_back({dev_h, nullptr, gran, 1});
+                if (ro == vmm::MapOutcome::MapFail) {
                     // restore map fail: S4 — bytes-holder = HOST handle
                     e->state = ExtentState::S4;
                     e->host = true;
-                    e->handle = host_handle;                } else if (rwhy == 2) {
+                    e->handle = host_handle;                } else if (ro == vmm::MapOutcome::AccessFail) {
                     // restore SetAccess fail: S4b — extent backing = HOST
                     e->state = ExtentState::S4b;
                     e->host = true;
@@ -789,21 +774,18 @@ MoveResult ElasticArray::rehomes_down(uint64_t off, uint64_t bytes) {
         }
 
         // (b) Map host handle -> W_h; SetAccess {HOST_NUMA rw, DEVICE rw}
-        const bool map_armed = vmm::fail_armed(vmm::FailOp::Map);
-        const bool access_armed = vmm::fail_armed(vmm::FailOp::SetAccess);
-        const bool ok = vmm::map_host_handle(reinterpret_cast<uint8_t*>(scratch_h_va_), gran, host_h);
-        const int why_b = composed_map_result(ok, map_armed, access_armed);
-        if (why_b == 1) {
-            release_ok(host_h);
+        const vmm::MapOutcome ok_b = vmm::map_host_handle(reinterpret_cast<uint8_t*>(scratch_h_va_), gran, host_h);
+        if (ok_b == vmm::MapOutcome::MapFail) {
+            if (!release_ok(host_h)) stuck_.push_back({host_h, nullptr, gran, 1});
             r.moved = moved;
             r.reason = reason_piece("map failed", chunk_idx, moved);
             fail_step = "b";
             break;
         }
-        if (why_b == 2) {
+        if (ok_b == vmm::MapOutcome::AccessFail) {
             if (unmap_with_retry(reinterpret_cast<uint8_t*>(scratch_h_va_), gran)) {
                 w_h_live_ = false;
-                release_ok(host_h);
+                if (!release_ok(host_h)) stuck_.push_back({host_h, nullptr, gran, 1});
             } else {
                 w_h_live_ = true;
                 stuck_.push_back({host_h, reinterpret_cast<uint8_t*>(scratch_h_va_), gran, 0});
@@ -819,7 +801,7 @@ MoveResult ElasticArray::rehomes_down(uint64_t off, uint64_t bytes) {
         if (!vmm::copy_d2h(reinterpret_cast<uint8_t*>(scratch_h_va_), base_ + chunk_off, gran)) {
             if (unmap_with_retry(reinterpret_cast<uint8_t*>(scratch_h_va_), gran)) {
                 w_h_live_ = false;
-                release_ok(host_h);
+                if (!release_ok(host_h)) stuck_.push_back({host_h, nullptr, gran, 1});
             } else {
                 stuck_.push_back({host_h, reinterpret_cast<uint8_t*>(scratch_h_va_), gran, 0});
             }
@@ -845,7 +827,7 @@ MoveResult ElasticArray::rehomes_down(uint64_t off, uint64_t bytes) {
         // (e) Unmap device from MAIN
         if (!unmap_with_retry(base_ + chunk_off, gran)) {
             // NOTHING CHANGED (L2b): device stays live; host released (unmapped — L3). No stuck entry.
-            release_ok(host_h);
+            if (!release_ok(host_h)) stuck_.push_back({host_h, nullptr, gran, 1});
             r.moved = moved;
             r.reason = "unmap refused; nothing moved beyond chunk " + std::to_string(chunk_idx + 1);
             fail_step = "e";
@@ -853,17 +835,11 @@ MoveResult ElasticArray::rehomes_down(uint64_t off, uint64_t bytes) {
         }
 
         // (f) Map host onto MAIN; SetAccess {HOST_NUMA rw, DEVICE rw}
-        const bool f_map_armed = vmm::fail_armed(vmm::FailOp::Map);
-        const bool f_access_armed = vmm::fail_armed(vmm::FailOp::SetAccess);
-        const bool fok = vmm::map_host_handle(base_ + chunk_off, gran, host_h);
-        const int fwhy = composed_map_result(fok, f_map_armed, f_access_armed);
-        if (fwhy == 1) {
+        const vmm::MapOutcome fo = vmm::map_host_handle(base_ + chunk_off, gran, host_h);
+        if (fo == vmm::MapOutcome::MapFail) {
             // map fail: RESTORE FIRST — map device onto MAIN + SetAccess {DEVICE rw}
-            const bool r_map_armed = vmm::fail_armed(vmm::FailOp::Map);
-            const bool r_access_armed = vmm::fail_armed(vmm::FailOp::SetAccess);
-            const bool rok = vmm::map_handle(base_ + chunk_off, gran, device_handle);
-            const int rwhy = composed_map_result(rok, r_map_armed, r_access_armed);
-            if (rwhy == 1) {
+            const vmm::MapOutcome ro = vmm::map_handle(base_ + chunk_off, gran, device_handle);
+            if (ro == vmm::MapOutcome::MapFail) {
                 // restore map fail: S4 — bytes-holder = FRESH HOST handle; DEVICE released (unmapped since e)
                 if (!release_ok(device_handle)) {
                     stuck_.push_back({device_handle, nullptr, gran, 1});
@@ -873,7 +849,7 @@ MoveResult ElasticArray::rehomes_down(uint64_t off, uint64_t bytes) {
                 e->handle = host_h;
                 e->pending = 0;
                 e->staging = 0;
-            } else if (rwhy == 2) {
+            } else if (ro == vmm::MapOutcome::AccessFail) {
                 // restore SetAccess fail: S4b — extent backing = DEVICE (mapped at MAIN)
                 if (!release_ok(host_h)) {
                     stuck_.push_back({host_h, nullptr, gran, 1});
@@ -899,15 +875,12 @@ MoveResult ElasticArray::rehomes_down(uint64_t off, uint64_t bytes) {
             fail_step = "f";
             break;
         }
-        if (fwhy == 2) {
+        if (fo == vmm::MapOutcome::AccessFail) {
             // SetAccess fail: host mapped at MAIN, no access — unmap it.
             if (unmap_with_retry(base_ + chunk_off, gran)) {
                 // unmap ok: restore device
-                const bool r_map_armed = vmm::fail_armed(vmm::FailOp::Map);
-                const bool r_access_armed = vmm::fail_armed(vmm::FailOp::SetAccess);
-                const bool rok = vmm::map_handle(base_ + chunk_off, gran, device_handle);
-                const int rwhy = composed_map_result(rok, r_map_armed, r_access_armed);
-                if (rwhy == 1) {
+                const vmm::MapOutcome ro = vmm::map_handle(base_ + chunk_off, gran, device_handle);
+                if (ro == vmm::MapOutcome::MapFail) {
                     // restore map fail: S4 — bytes-holder = FRESH HOST handle (named; copy (c)
                     // succeeded, so the bytes live ONLY in it — it must be kept). The device is
                     // the old backing, unmapped since e: released (L3).
@@ -917,7 +890,7 @@ MoveResult ElasticArray::rehomes_down(uint64_t off, uint64_t bytes) {
                     e->state = ExtentState::S4;
                     e->host = true;
                     e->handle = host_h;
-                } else if (rwhy == 2) {
+                } else if (ro == vmm::MapOutcome::AccessFail) {
                     // restore SetAccess fail: S4b — extent backing = DEVICE (mapped at MAIN)
                     if (!release_ok(host_h)) {
                         stuck_.push_back({host_h, nullptr, gran, 1});

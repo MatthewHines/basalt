@@ -658,7 +658,8 @@ model::Result InklingModel::load_experts(core::LoadPlan& reads, int file, uint64
                 return fail("out of device memory loading layer " + std::to_string(l) + "'s experts");
             }
             for (uint64_t at = r.own; at < r.bytes; at += gran) {
-                if (core::vmm::map_handle(r.va + at, gran, staging_[(size_t) ((at - r.own) / gran)])) continue;
+                if (core::vmm::map_handle(r.va + at, gran, staging_[(size_t) ((at - r.own) / gran)]) == core::vmm::MapOutcome::Ok) continue;
+                core::vmm::unmap_only(r.va + at, gran);  // AccessFail leaves it mapped (L2b): the caller unmaps
                 core::vmm::unmap_only(r.va + r.own, at - r.own);
                 if (r.handle) core::vmm::unmap(r.va, r.own, r.handle);
                 core::vmm::release_range(r.va, r.bytes);

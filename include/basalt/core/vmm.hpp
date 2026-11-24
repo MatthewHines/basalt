@@ -25,6 +25,8 @@ uint8_t* reserve(uint64_t bytes);
 void release_range(uint8_t* va, uint64_t bytes);
 /// Backs `[va, va + bytes)` with a new physical allocation on the current device, readable and writable by it.
 /// Returns the handle (0 on failure: nothing is left mapped).
+/// Full-create maps (create+map+access fused) roll back internally on any step failure — distinct
+/// from the composed maps above, whose AccessFail leaves the handle mapped for the procedure.
 unsigned long long map(uint8_t* va, uint64_t bytes);
 /// Backs `[va, va + bytes)` with a new physical allocation in host NUMA memory: the bytes live in RAM and both the
 /// CPU and the current device reach them at `va` (the GPU over the bus).  `va` and `bytes` must fit the host
@@ -36,8 +38,12 @@ bool unmap(uint8_t* va, uint64_t bytes, unsigned long long handle);
 /// `map_handle` can put under several ranges at once, so they share its bytes.  `release` drops the caller's reference;
 /// the memory is freed once every mapping of it is gone too.
 unsigned long long create(uint64_t bytes);
+/// Outcome of a composed map (map + canonical SetAccess). On AccessFail the handle STAYS
+/// mapped-without-access: the calling procedure owns the cleanup unmap (L2b) — an internal
+/// rollback would make the procedure's unmap hit an already-unmapped range and phantom-stick.
+enum class MapOutcome { Ok, MapFail, AccessFail };
 /// Maps the first `bytes` of `handle` at `va`, readable and writable by the current device.
-bool map_handle(uint8_t* va, uint64_t bytes, unsigned long long handle);
+MapOutcome map_handle(uint8_t* va, uint64_t bytes, unsigned long long handle);
 /// Unmaps `[va, va + bytes)` without releasing any handle (the mapping's reference goes with it).
 /// True when the range really is unmapped; false on driver failure or when fail-shim-armed (then
 /// nothing is touched). Callers that retry — the elastic-array unmap brackets — need the result.
@@ -54,15 +60,17 @@ void fail_next(FailOp op);
 /// Positional arming: the next `skip` matching calls SUCCEED, then the following `count` fail.
 /// (Rows like "f fails, b succeeds" need to skip the earlier same-op calls in the same procedure.)
 void fail_after(FailOp op, unsigned skip, unsigned count = 1);
-/// Peek at whether an arm is pending (tests assert one-shot consumption with this).
+/// "Does the next matching call CONSUME an arm" — false while a positional skip still lets the
+/// call pass (the armed failure belongs to a later same-op call). Procedures rely on this being
+/// consumption-truth, not merely armed-count.
 bool fail_armed(FailOp op);
 /// Drop every pending arm (test hygiene: rows must not inherit another row's unconsumed arms).
 void reset_arms();
 
 /// A physical allocation of `bytes` in host NUMA memory, mapped nowhere (0 on failure).
 unsigned long long create_host(uint64_t bytes);
-/// Maps `[va, va + bytes)` with the host canonical access ({HOST_NUMA rw, DEVICE rw}); false on failure.
-bool map_host_handle(uint8_t* va, uint64_t bytes, unsigned long long handle);
+/// Maps `[va, va + bytes)` with the host canonical access ({HOST_NUMA rw, DEVICE rw}).
+MapOutcome map_host_handle(uint8_t* va, uint64_t bytes, unsigned long long handle);
 /// Re-run the device canonical access over `[va, va + bytes)` (S4b repair); false on failure.
 bool set_access_device(uint8_t* va, uint64_t bytes);
 /// Re-run the host canonical access over `[va, va + bytes)` (S4b repair); false on failure.

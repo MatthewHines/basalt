@@ -265,16 +265,15 @@ unsigned long long create(uint64_t bytes) {
     return v.create(&h, (size_t) bytes, &prop, 0) == CUDA_SUCCESS ? (unsigned long long) h : 0;
 }
 
-bool map_handle(uint8_t* va, uint64_t bytes, unsigned long long handle) {
+MapOutcome map_handle(uint8_t* va, uint64_t bytes, unsigned long long handle) {
     const Fns& v = fns();
-    if (!v.ok || handle == 0) return false;
-    if (take_arm(FailOp::Map)) return false;
+    if (!v.ok || handle == 0) return MapOutcome::MapFail;
+    if (take_arm(FailOp::Map)) return MapOutcome::MapFail;  // a pending access arm stays pending
     const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(va);
-    // Peek-before-consume for SetAccess: when the access is armed but this call's map never
-    // happens (or fails), the access arm must stay pending — else a later cleanup unmap is fed
-    // an already-unmapped handle and the driver releases the payload with it (row-killers).
-    if (v.map(p, (size_t) bytes, 0, (CUmemGenericAllocationHandle) handle, 0) != CUDA_SUCCESS) { take_arm(FailOp::SetAccess); return false; }
-    if (take_arm(FailOp::SetAccess)) return false;
+    // Driver-map failure consumes this step's access arm (the composed step is one pair; in
+    // production the shim is off, so the take is a no-op — it only keeps row arming honest).
+    if (v.map(p, (size_t) bytes, 0, (CUmemGenericAllocationHandle) handle, 0) != CUDA_SUCCESS) { take_arm(FailOp::SetAccess); return MapOutcome::MapFail; }
+    if (take_arm(FailOp::SetAccess)) return MapOutcome::AccessFail;
     CUmemAccessDesc access{};
     access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     access.location.id = current_device();
@@ -282,8 +281,8 @@ bool map_handle(uint8_t* va, uint64_t bytes, unsigned long long handle) {
     // Design f2/L2b: on access failure the handle STAYS mapped-without-access; the calling
     // procedure owns the cleanup unmap (an internal rollback would make the procedure's unmap
     // hit an already-unmapped range and phantom-stick). Shim and real failures behave alike.
-    if (v.set_access(p, (size_t) bytes, &access, 1) == CUDA_SUCCESS) return true;
-    return false;
+    if (v.set_access(p, (size_t) bytes, &access, 1) == CUDA_SUCCESS) return MapOutcome::Ok;
+    return MapOutcome::AccessFail;  // mapped-without-access (L2b); the procedure owns the unmap
 }
 
 bool unmap_only(uint8_t* va, uint64_t bytes) {
@@ -330,24 +329,21 @@ unsigned long long create_host(uint64_t bytes) {
     return v.create(&h, (size_t) bytes, &prop, 0) == CUDA_SUCCESS ? (unsigned long long) h : 0;
 }
 
-bool map_host_handle(uint8_t* va, uint64_t bytes, unsigned long long handle) {
+MapOutcome map_host_handle(uint8_t* va, uint64_t bytes, unsigned long long handle) {
     const Fns& v = fns();
-    if (!v.ok || !bytes || handle == 0) return false;
-    if (take_arm(FailOp::Map)) return false;
+    if (!v.ok || !bytes || handle == 0) return MapOutcome::MapFail;
+    if (take_arm(FailOp::Map)) return MapOutcome::MapFail;  // a pending access arm stays pending
     CUmemAllocationProp prop{};
     size_t g = 0;
-    if (!host_prop(prop, g) || bytes % g || reinterpret_cast<uintptr_t>(va) % g) return false;
+    if (!host_prop(prop, g) || bytes % g || reinterpret_cast<uintptr_t>(va) % g) return MapOutcome::MapFail;
     const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(va);
-    // Peek-before-consume for SetAccess: when the access is armed but this call's map never
-    // happens (or fails), the access arm must stay pending — else a later cleanup unmap is fed
-    // an already-unmapped handle and the driver releases the payload with it (row-killers).
-    if (v.map(p, (size_t) bytes, 0, (CUmemGenericAllocationHandle) handle, 0) != CUDA_SUCCESS) { take_arm(FailOp::SetAccess); return false; }
-    if (take_arm(FailOp::SetAccess)) return false;
+    if (v.map(p, (size_t) bytes, 0, (CUmemGenericAllocationHandle) handle, 0) != CUDA_SUCCESS) { take_arm(FailOp::SetAccess); return MapOutcome::MapFail; }
+    if (take_arm(FailOp::SetAccess)) return MapOutcome::AccessFail;
     const int dev = current_device();
     CUmemAccessDesc access[] = {{prop.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE},
         {{CU_MEM_LOCATION_TYPE_DEVICE, dev}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}};
-    if (v.set_access(p, (size_t) bytes, access, 2) == CUDA_SUCCESS) return true;
-    return false;  // mapped-without-access (L2b); the procedure owns the unmap
+    if (v.set_access(p, (size_t) bytes, access, 2) == CUDA_SUCCESS) return MapOutcome::Ok;
+    return MapOutcome::AccessFail;  // mapped-without-access (L2b); the procedure owns the unmap
 }
 
 bool set_access_device(uint8_t* va, uint64_t bytes) {
