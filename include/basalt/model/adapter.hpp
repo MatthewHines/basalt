@@ -107,6 +107,8 @@ struct LoadRequest {
     RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
     RouteFlags route;                 ///< the lossy routing flags, for a model that takes them (route_flags.hpp)
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
+    int64_t kv_idle_demote_seconds = 0;  ///< --kv-idle-demote-seconds: retire an idle lane's slice after N s (0: off; S2)
+    int64_t kv_keep_warm_cells = 8192;   ///< --kv-keep-warm-cells: newest cells kept device-backed through a retire (S2)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
 };
 
