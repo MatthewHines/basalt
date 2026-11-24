@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <algorithm>
+#include <array>
 
 namespace basalt::core::vmm {
 namespace {
@@ -65,6 +66,18 @@ CUmemAllocationProp device_prop(int dev) {
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = dev;
     return prop;
+}
+
+// The fail-shim: one-shot arms per op (an op armed twice fails twice), plus positional skips
+// (fail_after lets a row pass the earlier same-op calls of a procedure and fail a later one).
+std::array<unsigned int, 9> armed{};
+std::array<unsigned int, 9> skip_arm{};
+unsigned int& arm_slot(FailOp op) { return armed[(size_t) op]; }
+bool take_arm(FailOp op) {
+    if (skip_arm[(size_t) op] > 0) { --skip_arm[(size_t) op]; return false; }
+    if (arm_slot(op) == 0) return false;
+    --arm_slot(op);
+    return true;
 }
 }  // namespace
 
@@ -177,12 +190,18 @@ void release_range(uint8_t* va, uint64_t bytes) {
 unsigned long long map(uint8_t* va, uint64_t bytes) {
     const Fns& v = fns();
     if (!v.ok) return 0;
+    if (take_arm(FailOp::Map)) return 0;
     const int dev = current_device();
     const CUmemAllocationProp prop = device_prop(dev);
     const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(va);
     CUmemGenericAllocationHandle h = 0;
     if (v.create(&h, (size_t) bytes, &prop, 0) != CUDA_SUCCESS) return 0;
     if (v.map(p, (size_t) bytes, 0, h, 0) != CUDA_SUCCESS) {
+        v.release(h);
+        return 0;
+    }
+    if (take_arm(FailOp::SetAccess)) {
+        v.unmap(p, (size_t) bytes);
         v.release(h);
         return 0;
     }
@@ -200,13 +219,20 @@ unsigned long long map(uint8_t* va, uint64_t bytes) {
 
 unsigned long long map_host(uint8_t* va, uint64_t bytes) {
     const Fns& v = fns();
+    if (!v.ok || !bytes) return 0;
+    if (take_arm(FailOp::Map)) return 0;
     CUmemAllocationProp prop{};
     size_t g = 0;
-    if (!v.ok || !bytes || !host_prop(prop, g) || bytes % g || reinterpret_cast<uintptr_t>(va) % g) return 0;
+    if (!host_prop(prop, g) || bytes % g || reinterpret_cast<uintptr_t>(va) % g) return 0;
     const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(va);
     CUmemGenericAllocationHandle h = 0;
     if (v.create(&h, (size_t) bytes, &prop, 0) != CUDA_SUCCESS) return 0;
     if (v.map(p, (size_t) bytes, 0, h, 0) != CUDA_SUCCESS) {
+        v.release(h);
+        return 0;
+    }
+    if (take_arm(FailOp::SetAccess)) {
+        v.unmap(p, (size_t) bytes);
         v.release(h);
         return 0;
     }
@@ -224,6 +250,7 @@ unsigned long long map_host(uint8_t* va, uint64_t bytes) {
 bool unmap(uint8_t* va, uint64_t bytes, unsigned long long handle) {
     const Fns& v = fns();
     if (!v.ok || handle == 0) return false;
+    if (take_arm(FailOp::Unmap)) return false;
     const bool a = v.unmap(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes) == CUDA_SUCCESS;
     const bool b = v.release((CUmemGenericAllocationHandle) handle) == CUDA_SUCCESS;
     return a && b;
@@ -232,6 +259,7 @@ bool unmap(uint8_t* va, uint64_t bytes, unsigned long long handle) {
 unsigned long long create(uint64_t bytes) {
     const Fns& v = fns();
     if (!v.ok) return 0;
+    if (take_arm(FailOp::Create)) return 0;
     const CUmemAllocationProp prop = device_prop(current_device());
     CUmemGenericAllocationHandle h = 0;
     return v.create(&h, (size_t) bytes, &prop, 0) == CUDA_SUCCESS ? (unsigned long long) h : 0;
@@ -240,25 +268,128 @@ unsigned long long create(uint64_t bytes) {
 bool map_handle(uint8_t* va, uint64_t bytes, unsigned long long handle) {
     const Fns& v = fns();
     if (!v.ok || handle == 0) return false;
+    if (take_arm(FailOp::Map)) return false;
     const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(va);
-    if (v.map(p, (size_t) bytes, 0, (CUmemGenericAllocationHandle) handle, 0) != CUDA_SUCCESS) return false;
+    // Peek-before-consume for SetAccess: when the access is armed but this call's map never
+    // happens (or fails), the access arm must stay pending — else a later cleanup unmap is fed
+    // an already-unmapped handle and the driver releases the payload with it (row-killers).
+    if (v.map(p, (size_t) bytes, 0, (CUmemGenericAllocationHandle) handle, 0) != CUDA_SUCCESS) { take_arm(FailOp::SetAccess); return false; }
+    if (take_arm(FailOp::SetAccess)) return false;
     CUmemAccessDesc access{};
     access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     access.location.id = current_device();
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    // Design f2/L2b: on access failure the handle STAYS mapped-without-access; the calling
+    // procedure owns the cleanup unmap (an internal rollback would make the procedure's unmap
+    // hit an already-unmapped range and phantom-stick). Shim and real failures behave alike.
     if (v.set_access(p, (size_t) bytes, &access, 1) == CUDA_SUCCESS) return true;
-    v.unmap(p, (size_t) bytes);
     return false;
 }
 
-void unmap_only(uint8_t* va, uint64_t bytes) {
+bool unmap_only(uint8_t* va, uint64_t bytes) {
     const Fns& v = fns();
-    if (v.ok && va != nullptr && bytes > 0) v.unmap(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes);
+    if (take_arm(FailOp::UnmapOnly)) return false;  // armed: fails without touching driver state
+    if (!v.ok || va == nullptr || bytes == 0) return false;
+    return v.unmap(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes) == CUDA_SUCCESS;
 }
 
 void release(unsigned long long handle) {
     const Fns& v = fns();
+    if (take_arm(FailOp::Release)) return;
     if (v.ok && handle != 0) v.release((CUmemGenericAllocationHandle) handle);
+}
+
+void fail_next(FailOp op) {
+    ++arm_slot(op);
+}
+
+void fail_after(FailOp op, unsigned skip, unsigned count) {
+    skip_arm[(size_t) op] += skip;
+    arm_slot(op) += count;
+}
+
+bool fail_armed(FailOp op) {
+    // "The next call of this op fails" = the call will CONSUME an arm, not a positional skip:
+    // with a skip pending the call passes and the armed failure belongs to a later same-op call.
+    return arm_slot(op) > 0 && skip_arm[(size_t) op] == 0;
+}
+
+void reset_arms() {
+    armed.fill(0);
+    skip_arm.fill(0);
+}
+
+unsigned long long create_host(uint64_t bytes) {
+    const Fns& v = fns();
+    if (!v.ok || !bytes) return 0;
+    if (take_arm(FailOp::CreateHost)) return 0;
+    CUmemAllocationProp prop{};
+    size_t g = 0;
+    if (!host_prop(prop, g)) return 0;
+    CUmemGenericAllocationHandle h = 0;
+    return v.create(&h, (size_t) bytes, &prop, 0) == CUDA_SUCCESS ? (unsigned long long) h : 0;
+}
+
+bool map_host_handle(uint8_t* va, uint64_t bytes, unsigned long long handle) {
+    const Fns& v = fns();
+    if (!v.ok || !bytes || handle == 0) return false;
+    if (take_arm(FailOp::Map)) return false;
+    CUmemAllocationProp prop{};
+    size_t g = 0;
+    if (!host_prop(prop, g) || bytes % g || reinterpret_cast<uintptr_t>(va) % g) return false;
+    const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(va);
+    // Peek-before-consume for SetAccess: when the access is armed but this call's map never
+    // happens (or fails), the access arm must stay pending — else a later cleanup unmap is fed
+    // an already-unmapped handle and the driver releases the payload with it (row-killers).
+    if (v.map(p, (size_t) bytes, 0, (CUmemGenericAllocationHandle) handle, 0) != CUDA_SUCCESS) { take_arm(FailOp::SetAccess); return false; }
+    if (take_arm(FailOp::SetAccess)) return false;
+    const int dev = current_device();
+    CUmemAccessDesc access[] = {{prop.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE},
+        {{CU_MEM_LOCATION_TYPE_DEVICE, dev}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}};
+    if (v.set_access(p, (size_t) bytes, access, 2) == CUDA_SUCCESS) return true;
+    return false;  // mapped-without-access (L2b); the procedure owns the unmap
+}
+
+bool set_access_device(uint8_t* va, uint64_t bytes) {
+    const Fns& v = fns();
+    if (!v.ok || !va || !bytes) return false;
+    if (take_arm(FailOp::SetAccess)) return false;
+    const int dev = current_device();
+    CUmemAccessDesc access{};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = dev;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    return v.set_access(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes, &access, 1) == CUDA_SUCCESS;
+}
+
+bool set_access_host(uint8_t* va, uint64_t bytes) {
+    const Fns& v = fns();
+    if (!v.ok || !va || !bytes) return false;
+    if (take_arm(FailOp::SetAccess)) return false;
+    CUmemAllocationProp prop{};
+    size_t g = 0;
+    if (!host_prop(prop, g)) return false;
+    const int dev = current_device();
+    CUmemAccessDesc access[] = {{prop.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE},
+        {{CU_MEM_LOCATION_TYPE_DEVICE, dev}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}};
+    return v.set_access(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes, access, 2) == CUDA_SUCCESS;
+}
+
+// The legacy cuMemcpy* driver symbols live in libcuda and are NOT resolvable through
+// cudaGetDriverEntryPointByVersion (cudaErrorStubLibrary) — the runtime cudaMemcpy is this engine's
+// synchronous-copy idiom (elastic_array already cudaMemsets mapped VAs), so the copies go through it.
+bool copy_h2d(uint8_t* dst_dev, const uint8_t* src_host, uint64_t bytes) {
+    const Fns& v = fns();
+    if (!v.ok || !dst_dev || !src_host || !bytes) return false;
+    if (take_arm(FailOp::CopyH2D)) return false;
+    return cudaMemcpy(dst_dev, src_host, (size_t) bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
+bool copy_d2h(uint8_t* dst_host, const uint8_t* src_dev, uint64_t bytes) {
+    const Fns& v = fns();
+    if (!v.ok || !dst_host || !src_dev || !bytes) return false;
+    if (take_arm(FailOp::CopyD2H)) return false;
+    return cudaMemcpy(dst_host, src_dev, (size_t) bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
 }  // namespace basalt::core::vmm
