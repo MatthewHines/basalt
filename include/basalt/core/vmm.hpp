@@ -39,7 +39,37 @@ unsigned long long create(uint64_t bytes);
 /// Maps the first `bytes` of `handle` at `va`, readable and writable by the current device.
 bool map_handle(uint8_t* va, uint64_t bytes, unsigned long long handle);
 /// Unmaps `[va, va + bytes)` without releasing any handle (the mapping's reference goes with it).
-void unmap_only(uint8_t* va, uint64_t bytes);
+/// True when the range really is unmapped; false on driver failure or when fail-shim-armed (then
+/// nothing is touched). Callers that retry — the elastic-array unmap brackets — need the result.
+bool unmap_only(uint8_t* va, uint64_t bytes);
 void release(unsigned long long handle);
+
+/// The fail-shim's one-shot operations.  Arming a matching op makes the next call to the wrapper that
+/// performs that operation fail exactly once (consumed on the call); a second arm repeats the failure on
+/// the next call.  An armed failure touches no driver state except the simulated unwind the design pins
+/// for the map+setaccess pair.
+enum class FailOp { Create, CreateHost, Map, SetAccess, Unmap, UnmapOnly, Release, CopyH2D, CopyD2H };
+/// Arm a one-shot failure on the next matching wrapper call (same op may be armed more than once).
+void fail_next(FailOp op);
+/// Positional arming: the next `skip` matching calls SUCCEED, then the following `count` fail.
+/// (Rows like "f fails, b succeeds" need to skip the earlier same-op calls in the same procedure.)
+void fail_after(FailOp op, unsigned skip, unsigned count = 1);
+/// Peek at whether an arm is pending (tests assert one-shot consumption with this).
+bool fail_armed(FailOp op);
+/// Drop every pending arm (test hygiene: rows must not inherit another row's unconsumed arms).
+void reset_arms();
+
+/// A physical allocation of `bytes` in host NUMA memory, mapped nowhere (0 on failure).
+unsigned long long create_host(uint64_t bytes);
+/// Maps `[va, va + bytes)` with the host canonical access ({HOST_NUMA rw, DEVICE rw}); false on failure.
+bool map_host_handle(uint8_t* va, uint64_t bytes, unsigned long long handle);
+/// Re-run the device canonical access over `[va, va + bytes)` (S4b repair); false on failure.
+bool set_access_device(uint8_t* va, uint64_t bytes);
+/// Re-run the host canonical access over `[va, va + bytes)` (S4b repair); false on failure.
+bool set_access_host(uint8_t* va, uint64_t bytes);
+/// Synchronous host-to-device copy of `bytes`; false on failure.
+bool copy_h2d(uint8_t* dst_dev, const uint8_t* src_host, uint64_t bytes);
+/// Synchronous device-to-host copy of `bytes`; false on failure.
+bool copy_d2h(uint8_t* dst_host, const uint8_t* src_dev, uint64_t bytes);
 
 }  // namespace basalt::core::vmm
