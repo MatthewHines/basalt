@@ -403,6 +403,8 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.rope = o.rope;
         lreq.route = o.route;
         lreq.kv_resident = o.kv_resident;
+        lreq.kv_idle_demote_seconds = o.kv_idle_demote_seconds;
+        lreq.kv_keep_warm_cells = o.kv_keep_warm_cells;
         lreq.card_gbps.push_back(o.main_gbps);
         lreq.card_gbps.insert(lreq.card_gbps.end(), o.peer_gbps.begin(), o.peer_gbps.end());
         lreq.diag_split_at = o.diag_split_at;

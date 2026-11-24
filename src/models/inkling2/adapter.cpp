@@ -63,6 +63,14 @@ public:
             o.kv_resident = std::atoll(args.next("--kv-resident"));
             return true;
         }
+        if (a == "--kv-idle-demote-seconds") {   // S2: retire an idle lane's KV slice to host backing (0: off)
+            o.kv_idle_demote_seconds = std::atoll(args.next("--kv-idle-demote-seconds"));
+            return true;
+        }
+        if (a == "--kv-keep-warm-cells") {   // S2: newest cells that stay device-backed through a retire
+            o.kv_keep_warm_cells = std::atoll(args.next("--kv-keep-warm-cells"));
+            return true;
+        }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK
     }
 

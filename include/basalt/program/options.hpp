@@ -58,6 +58,8 @@ struct CommonOptions {
     /// --kv-resident N: K/V streaming, N cells of each attention layer in VRAM and the rest in page-locked RAM (0: all in
     /// VRAM), for the models that take it
     int64_t kv_resident = 0;
+    int64_t kv_idle_demote_seconds = 0;   // --kv-idle-demote-seconds: retire an idle lane's KV slice after N s (0: off)
+    int64_t kv_keep_warm_cells = 8192;    // --kv-keep-warm-cells: newest cells that stay device-backed through a retire
     /// --diag-split-at N: diagnostic, a model split across two cards at layer N whatever the start would pick (0: off)
     int diag_rows = 0;
     int diag_split_at = 0;

@@ -479,7 +479,7 @@ endif()
 # Defined in cmake/platform.cmake, included above with `warnings`.
 
 # ---- core (GPU runtime) ---------------------------------------------
-add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/elastic_array.cpp src/core/file_reads.cpp src/core/graph.cpp src/core/weights.cpp src/core/loader.cpp
+add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/elastic_array.cpp src/core/kv_policy.cpp src/core/file_reads.cpp src/core/graph.cpp src/core/weights.cpp src/core/loader.cpp
                              src/core/host_plan.cpp src/core/checkpoint_transfer.cpp src/core/staged_copy.cpp src/core/prompt_stage.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
@@ -1614,6 +1614,9 @@ set_tests_properties(vmm_fail_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 add_executable(elastic_rehome_test tests/core/elastic_rehome_test.cpp)
 target_link_libraries(elastic_rehome_test PRIVATE core ${_gpu_runtime_target})
 basalt_gpu_test(NAME elastic_rehome_test COMMAND elastic_rehome_test)
+add_executable(kv_policy_test tests/core/kv_policy_test.cpp)
+target_link_libraries(kv_policy_test PRIVATE core)
+basalt_cpu_test(NAME kv_policy_test COMMAND kv_policy_test)
 set_tests_properties(elastic_rehome_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 add_executable(shipped_profiles_test tests/core/shipped_profiles_test.cpp)
 target_link_libraries(shipped_profiles_test PRIVATE platform)

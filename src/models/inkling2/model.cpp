@@ -390,6 +390,10 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         kv_res_ = req.kv_resident;
         if (kv_res_ < 0) return fail("--kv-resident must be >= 0");
         if (kv_res_ > 0 && kv_res_ < 1024) return fail("--kv-resident keeps at least 1,024 cells on the card");
+        kv_idle_s_ = req.kv_idle_demote_seconds;   // S2 policy config; nothing consumes it until the session wiring (M2)
+        if (kv_idle_s_ < 0) return fail("--kv-idle-demote-seconds must be >= 0");
+        kv_keep_warm_ = req.kv_keep_warm_cells;
+        if (kv_keep_warm_ < 0) return fail("--kv-keep-warm-cells must be >= 0");
         if (kv_res_ >= want) kv_res_ = 0;   // every cell stays on the card anyway: off
         if (kv_res_ > 0 && cut_ > 0) return fail("inkling2: --kv-resident is one card; the layer split keeps every cache on its card");
         if (kv_res_ > 0 && !core::vmm::supported()) return fail("inkling2: --kv-resident needs virtual memory management");

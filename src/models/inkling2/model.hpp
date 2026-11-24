@@ -101,6 +101,8 @@ public:
     bool elastic() const { return elastic_; }
     /// The cells of K/V each attention layer keeps in VRAM (--kv-resident, per session; 0: all on the card).
     int64_t kv_resident() const { return kv_res_; }
+    int64_t kv_idle_demote_seconds() const { return kv_idle_s_; }      // S2: 0 keeps today's behavior (feature off)
+    int64_t kv_keep_warm_cells() const { return kv_keep_warm_; }
     /// Copies RAM experts to the card, the most routed first, while `keep_free` bytes stay free; their blob table entries
     /// point at the copies (decode reads them there; a prompt chunk's staging is unchanged). Bytes copied.
     uint64_t promote(uint64_t keep_free);
@@ -181,6 +183,8 @@ private:
     uint64_t reserve_ = 0;
     bool lent_ = false;
     int64_t kv_res_ = 0;   // --kv-resident cells per attention layer (0: all on the card)
+    int64_t kv_idle_s_ = 0;         // --kv-idle-demote-seconds (S2; 0: retire policy off)
+    int64_t kv_keep_warm_ = 8192;   // --kv-keep-warm-cells (S2: newest cells kept device-backed through a retire)
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
     std::vector<void*> copy_;
     int64_t n_copy_ = 0;
