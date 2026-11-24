@@ -204,7 +204,7 @@ static void test_t4() {
     bool ok = arr->ensure(4 * g_gran, 0, err);
     mark(arr->backed() == 2 * g_gran, "T4: growth clamps at the host boundary (hole respected)");
     mark(arr->host_start() == g_gran, "T4: host boundary unmoved by the clamped ensure");
-    mark(ok || !err.empty(), "T4: refusal (if any) carries a reason");
+    mark(ok, "T4: clamped ensure succeeds (a refusal would be the defect)");
 
 }
 
@@ -459,8 +459,9 @@ static void row_pb_access_unmap_fails() {
     auto stuck = arr->stuck_entries();
     mark(stuck.size() == 1, "T7 Pb-ac-fail: one stuck entry");
     if (stuck.size() == 1)
-        mark(stuck[0].va == arr->data() + g_gran || stuck[0].va != nullptr,
-             "T7 Pb-ac-fail: stuck entry owns a VA");
+    if (!stuck.empty()) mark(stuck[0].kind == 0 && stuck[0].va != nullptr &&
+                             stuck[0].va != arr->data() + g_gran,
+                             "T7 Pb-ac-fail: unmap-failed entry at scratch (kind 0, not MAIN)");
     mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pb-ac-fail: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pb-ac-fail: I1/I2 hold");
 }
@@ -553,6 +554,9 @@ static void row_pf_map_restore_ok() {
     std::string err;
     auto arr = make_promote_fixture(err);
     if (!arr) { std::printf("T7 Pf-ok: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    std::memcpy(arr->data() + g_gran, pattern.data(), g_gran);   // T1 idiom (host-backed granule)
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_after(basalt::core::vmm::FailOp::Map, 1);  // step (f) map fails (b passed)
@@ -561,6 +565,7 @@ static void row_pf_map_restore_ok() {
     mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Pf-ok: S0");
     mark(arr->scratch_live_maps() == 0, "T7 Pf-ok: scratch 0");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Pf-ok: handles delta 0");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pf-map-ok: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pf-ok: I1/I2 hold");
 }
 
@@ -579,6 +584,7 @@ static void row_pf_map_restore_access_fail() {
     mark(arr->scratch_live_maps() == 0, "T7 Pf-ac-fail: scratch 0");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Pf-ac-fail: handles delta 0");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pf-ac-fail: I1/I2 hold");
+    mark(arr->bytes_holder(g_gran) != 0, "T7 Pf-map-ac-fail: bytes retained by holder (5.4)");
 }
 
 // Row Pf: map, restore map fail → S4, scratch 0, handles 0, host=bytes-holder; device released.
@@ -603,6 +609,9 @@ static void row_pf_access_unmap_ok() {
     std::string err;
     auto arr = make_promote_fixture(err);
     if (!arr) { std::printf("T7 Pf-ac-ok: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    std::memcpy(arr->data() + g_gran, pattern.data(), g_gran);   // T1 idiom (host-backed granule)
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_after(basalt::core::vmm::FailOp::SetAccess, 1);  // step (f) access fails (b passed)
@@ -611,6 +620,7 @@ static void row_pf_access_unmap_ok() {
     mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Pf-ac-ok: S0");
     mark(arr->scratch_live_maps() == 0, "T7 Pf-ac-ok: scratch 0");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Pf-ac-ok: handles delta 0");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pf-ac-ok: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pf-ac-ok: I1/I2 hold");
 }
 
@@ -651,6 +661,7 @@ static void row_pg() {
     auto stuck = arr->stuck_entries();
     mark(stuck.size() == 1, "T7 Pg: one release-pending stuck entry");
     if (!stuck.empty()) mark(stuck[0].va == nullptr, "T7 Pg: release-pending entry has null VA");
+    if (!stuck.empty()) mark(stuck[0].kind == 1, "T7 Pg: entry kind = release-pending");
     mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Pg: bytes intact");
     mark(arr->host_start() == basalt::core::ElasticArray::kNoHost, "T7 Pg: flip stands (no host extent left)");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Pg: I1/I2 hold");
@@ -692,6 +703,7 @@ static void row_da() {
     mark_eq(arr->live_handle_count(), lh_before, "T7 Da: handles delta 0");
     mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Da: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Da: I1/I2 hold");
+    mark(r.reason.find("host oom") != std::string::npos, "T7 Da: reason names host oom");
 }
 
 static void row_db_map() {
@@ -843,6 +855,10 @@ static void row_df_map_restore_ok() {
     std::string err;
     auto arr = make_demote_fixture(err);
     if (!arr) { std::printf("T7 Df-ok: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    if (!basalt::core::vmm::copy_h2d(arr->data() + g_gran, pattern.data(), g_gran))
+        { mark(false, "T7 Df-map-ok: pattern write"); return; }
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_after(basalt::core::vmm::FailOp::Map, 1);  // step (f) map fails (b passed)
@@ -851,6 +867,7 @@ static void row_df_map_restore_ok() {
     mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Df-ok: S0");
     mark(arr->scratch_live_maps() == 0, "T7 Df-ok: scratch 0");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Df-ok: handles delta 0");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Df-map-ok: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Df-ok: I1/I2 hold");
 }
 
@@ -868,6 +885,7 @@ static void row_df_map_restore_access_fail() {
     mark(arr->scratch_live_maps() == 0, "T7 Df-ac-fail: scratch 0");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Df-ac-fail: handles delta 0");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Df-ac-fail: I1/I2 hold");
+    mark(arr->bytes_holder(g_gran) != 0, "T7 Df-map-ac-fail: bytes retained by holder (5.4)");
 }
 
 static void row_df_map_restore_map_fail() {
@@ -890,6 +908,10 @@ static void row_df_access_unmap_ok() {
     std::string err;
     auto arr = make_demote_fixture(err);
     if (!arr) { std::printf("T7 Df-ac-ok: SKIP fixture setup: %s\n", err.c_str()); ++fails; return; }
+    std::vector<uint8_t> pattern(g_gran);
+    for (uint64_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(i * 11 + 5);
+    if (!basalt::core::vmm::copy_h2d(arr->data() + g_gran, pattern.data(), g_gran))
+        { mark(false, "T7 Df-ac-ok: pattern write"); return; }
     uint64_t lh_before = arr->live_handle_count();
     clear_ledger();
     basalt::core::vmm::fail_after(basalt::core::vmm::FailOp::SetAccess, 1);  // step (f) access fails (b passed)
@@ -898,6 +920,7 @@ static void row_df_access_unmap_ok() {
     mark(arr->extent_state(g_gran) == basalt::core::ExtentState::S0, "T7 Df-ac-ok: S0");
     mark(arr->scratch_live_maps() == 0, "T7 Df-ac-ok: scratch 0");
     mark_eq(arr->live_handle_count(), lh_before, "T7 Df-ac-ok: handles delta 0");
+    mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Df-ac-ok: bytes intact");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Df-ac-ok: I1/I2 hold");
 }
 
@@ -918,6 +941,9 @@ static void row_df_access_unmap_fails() {
     auto stuck = arr->stuck_entries();
     mark(stuck.empty(), "T7 Df-ac-fail: no stuck entries");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Df-ac-fail: I1/I2 hold");
+    mark(arr->bytes_holder(g_gran) != 0, "T7 Df-ac-fail: bytes retained by holder (5.4)");
+    // coverage note: backing flip (host) is not discriminating in this fixture (host_start==0
+    // either way); per-extent backing accessor is a later-slice API — flip proven via repair re-verify.
 }
 
 // Composite (prose procedure; no table row): Pf SetAccess, unmap ok, RESTORE-MAP fail -> S4 with
@@ -996,9 +1022,12 @@ static void row_dg() {
     auto stuck = arr->stuck_entries();
     mark(stuck.size() == 1, "T7 Dg: one release-pending stuck entry");
     if (!stuck.empty()) mark(stuck[0].va == nullptr, "T7 Dg: release-pending entry has null VA");
+    if (!stuck.empty()) mark(stuck[0].kind == 1, "T7 Dg: entry kind = release-pending");
     mark(verify_bytes(*arr, g_gran, g_gran, pattern.data()), "T7 Dg: bytes intact");
     mark(arr->host_start() == 0, "T7 Dg: flip stands (host starts at 0)");
     mark(arr->i1_ok() && arr->i2_ok(), "T7 Dg: I1/I2 hold");
+    // coverage note: host_start()==0 is vacuous for the flip here (chunk 0 already host);
+    // pinned instead via kind==1 + ledger; per-extent backing accessor is a later-slice API.
 }
 
 static void test_t7_demote_rows() {
