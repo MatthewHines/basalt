@@ -124,6 +124,9 @@ void ElasticArray::repair_sweep() {
         StuckRecord& s = stuck_[i];
         if (s.kind == 0) {  // unmap-failed: retry the unmap; on success release (L3)
             if (unmap_with_retry(s.va, s.bytes)) {
+                // The mapping this entry recorded no longer exists: retire its window flag.
+                if (s.va == reinterpret_cast<uint8_t*>(scratch_d_va_)) w_d_live_ = false;
+                else if (s.va == reinterpret_cast<uint8_t*>(scratch_h_va_)) w_h_live_ = false;
                 if (!release_ok(s.handle)) {
                     stuck_.push_back({s.handle, nullptr, s.bytes, 1});
                 }
@@ -581,7 +584,7 @@ MoveResult ElasticArray::rehome(uint64_t off, uint64_t bytes, uint64_t keep_free
 
         // (e) Unmap host from MAIN
         if (!unmap_with_retry(base_ + chunk_off, gran)) {
-            // NOTHING CHANGED (L2b): host stays live; device released (unmapped — L3). No stuck entry.
+            // NOTHING CHANGED (L2b): host stays live; device released (unmapped — L3); a failed release records its rule-iv entry.
             if (!release_ok(dev_h)) stuck_.push_back({dev_h, nullptr, gran, 1});
             r.moved = moved;
             r.reason = "unmap refused; nothing moved beyond chunk " + std::to_string(chunk_idx + 1);
@@ -819,7 +822,7 @@ MoveResult ElasticArray::rehomes_down(uint64_t off, uint64_t bytes) {
 
         // (e) Unmap device from MAIN
         if (!unmap_with_retry(base_ + chunk_off, gran)) {
-            // NOTHING CHANGED (L2b): device stays live; host released (unmapped — L3). No stuck entry.
+            // NOTHING CHANGED (L2b): device stays live; host released (unmapped — L3); a failed release records its rule-iv entry.
             if (!release_ok(host_h)) stuck_.push_back({host_h, nullptr, gran, 1});
             r.moved = moved;
             r.reason = "unmap refused; nothing moved beyond chunk " + std::to_string(chunk_idx + 1);
