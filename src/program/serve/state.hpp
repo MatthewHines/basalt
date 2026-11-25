@@ -4,6 +4,7 @@
 #include "../cli/tokens.hpp"
 #include "console_stats.hpp"
 #include "basalt/core/checkpoint_transfer.hpp"
+#include "basalt/core/kv_policy.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/conversation_memory.hpp"
 #include "basalt/core/conversation_store.hpp"
@@ -300,6 +301,11 @@ public:
         int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
     };
     std::vector<BSlot> bs{};
+    // ---- S2 idle-lane KV retire: the policy state and quiet clocks, one pair per lane. retire_idle_lanes() drives
+    // them at the loop's idle moments; the wall clock makes every decision, the moments only wake it.
+    std::vector<basalt::core::KvSlotPolicy> kv_pol;
+    std::vector<Clock::time_point> kv_idle_at;
+    bool kv_line_busy = false;   // a solo generation was read and has not parked yet (the next idle tick closes its clock)
     // ---- --batch: the slots' rounds (batch_round.cpp), the same for every model
     /// The session slot `b` decodes in.
     virtual basalt::model::ModelSession& slot_session(int b) = 0;
@@ -360,6 +366,11 @@ public:
     int next_line_within(std::string& out, int ms);
     bool halted();
     bool batch_on();
+    // S2 retire: the loop's idle moments call these (definitions in commands.cpp)
+    void retire_idle_lanes();                        // every lane whose quiet period passed hands its cache to host backing
+    void kv_note_activity(const std::string& line);  // a generation line is the solo lane's activity edge
+    void kv_stamp_idle(size_t lane);                 // the lane's run ended, now
+    void kv_note_wake(size_t lane);                  // a run starts on a retired lane (bookkeeping; warming is M3)
     bool try_next_line(std::string& out);
 };
 

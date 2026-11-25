@@ -156,6 +156,12 @@ public:
     virtual Result prefill_chunk(const PrefillRequest& r) = 0;
     /// The rows a decode_batch call holds in all; 0: this model's sessions do not batch their windows.
     virtual int batch_rows() const { return 0; }
+    /// S2 cache-stream management: retire this session's KV cache from the card down to `keep_warm_cells` position cells
+    /// per array. The retired bytes stay readable (host backing, host speed); the VAs never move. Bytes freed.
+    /// Default: no elastic KV — there is nothing to retire.
+    virtual bool kv_retire(int64_t keep_warm_cells, uint64_t& freed_bytes, std::string& err) {
+        (void) keep_warm_cells; (void) err; freed_bytes = 0; return true;
+    }
     /// The windows reqs[0..n) of the distinct sessions[0..n) (sessions of one model, this one among them) as one batch, the
     /// model's weights read once: each session ends as after its own decode_window(reqs[i]). The windows' rows total at most
     /// batch_rows().
