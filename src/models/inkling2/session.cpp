@@ -457,8 +457,9 @@ protected:
                 // M4.2: headroom is re-read PER RUN, not once at entry — the floor-0 span is ~40x the old
                 // window, so the entry read goes stale the moment the cold-head run lands and the tail run
                 // then passes a check its bytes no longer fit (rehome's own floor refuses it, logging the
-                // 'floor failed' spam this pre-check exists to prevent). The retire shape is 2 runs per
-                // array, so one extra cudaMemGetInfo per candidate run is microscopic against the DMA.
+                // 'floor failed' spam this pre-check exists to prevent). host_runs() can in principle yield
+                // more runs than a retire makes (review A/F1), but each extra read is a microsecond driver
+                // query against multi-millisecond DMA, and it sits after the e <= s short-circuit.
                 uint64_t free_now = 0;
                 cudaMemGetInfo(&free_now, &total);
                 if (free_now < (e - s) + m_.held_free(kElasticKeep)) continue;
@@ -469,11 +470,13 @@ protected:
         if (moved) {
             size_t free1 = 0;
             cudaMemGetInfo(&free1, &total);
-            // M4.2 (R8 honest-log): report the cells ACTUALLY moved, not the requested window. Post-M4.1 the
+            // M4.2 (R8 honest-log): report the bytes ACTUALLY moved, not the requested window. Post-M4.1 the
             // move spans [0, hi) while pos_lo only guards emptiness, so the old 'hi - pos_lo' under-reported
-            // every continuation wake (observed '0.31 GiB ... (span 8193 cells)').
-            basalt::log::info("inkling2", "kv warm: %.2f GiB of this lane's cache returned to the card (moved %lld cells, %.2f -> %.2f GiB free)",
-                              (double)moved / (double)(1ull << 30), (long long)(moved / cb),
+            // every continuation wake (observed '0.31 GiB ... (span 8193 cells)'). M4.2.1 (review B5): GiB only —
+            // 'cells' in this ledger means conversation positions, but the move sums the K and V arrays per
+            // visit, so no single cell count here is honest; the reader divides GiB by the model's per-pos cost.
+            basalt::log::info("inkling2", "kv warm: %.2f GiB of this lane's cache returned to the card (%.2f -> %.2f GiB free)",
+                              (double)moved / (double)(1ull << 30),
                               (double)free0 / (double)(1ull << 30), (double)free1 / (double)(1ull << 30));
         }
     }
