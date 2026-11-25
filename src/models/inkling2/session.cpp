@@ -422,15 +422,19 @@ protected:
         rewarm_incoming(r.pos, r.pos + r.n_tokens);   // S2 R4: the span comes home before the first token
         return true;
     }
-    // S2 wake re-warm (R4, spans only): the incoming span comes back to the card BEFORE the first token.
-    // Reads host_runs() (mirror law of the retire): host bytes are whatever the extent table says, never a
-    // region inferred from host_start(). Span = [pos_lo, pos_hi + one step), capped at the context; ends on
-    // the grid; moves only as far as the card affords WITHOUT touching the grow floor (held_free law, same
-    // as ensure). A refused move is fine — the cell stays host-backed and reads at host speed, and the next
-    // request tries again. Re-warming an already-warm span is a cheap no-op (no host runs intersect), so the
-    // call sites do not gate on retired state — the extent table is the truth. History re-warm is OQ-3.
+    // S2 wake re-warm (R4, spans only): a wake brings back everything the conversation will READ again —
+    // all cells below the incoming window plus one write step — BEFORE the first token. Attention reads the
+    // whole span [0, pos), so a continuation (prompt-cache hit: incoming = the new window only, pos well
+    // above 0) that warmed only its window left the cold head on host and paid the S0b host-read tax on EVERY
+    // token — measured 31 t/s wake decode vs 374 t/s OFF, M4 window. The span floor is therefore 0, not
+    // pos_lo. Reads host_runs() (mirror law of the retire): host bytes are whatever the extent table says,
+    // never a region inferred from host_start(). Span = [0, pos_hi + one step), capped at the context; ends
+    // on the grid; moves only as far as the card affords WITHOUT touching the grow floor (held_free law,
+    // same as ensure). A refused move is fine — the cell stays host-backed and reads at host speed, and the
+    // next request tries again. Re-warming an already-warm span is a cheap no-op (no host runs intersect), so
+    // the call sites do not gate on retired state — the extent table is the truth. History re-warm is OQ-3.
     void rewarm_incoming(int64_t pos_lo, int64_t pos_hi) {
-        if (elastic_.empty() || pos_hi <= pos_lo) return;
+        if (elastic_.empty() || pos_hi <= pos_lo) return;   // pos_lo guards emptiness only; the span starts at 0
         const int64_t hi = std::min<int64_t>(m_.context(), pos_hi + kElasticKvStep);
         const uint64_t cb = cell_bytes();
         uint64_t moved = 0;
@@ -439,7 +443,7 @@ protected:
         for (auto& a : elastic_) {
             const uint64_t gran = a->granularity();
             if (gran == 0) continue;   // plain fallback arrays: no granules, nothing to move (same law as retire)
-            const uint64_t s_lo = (uint64_t)pos_lo * cb, s_hi = (uint64_t)hi * cb;
+            const uint64_t s_lo = 0, s_hi = (uint64_t)hi * cb;   // M4.1: floor 0 — attention reads [0, pos)
             for (const auto& [off, bytes] : a->host_runs()) {
                 const uint64_t s = std::max(off, s_lo / gran * gran);
                 // Both ends on the grid, MIRRORS of the retire law: a short piece at either end stays where it is
