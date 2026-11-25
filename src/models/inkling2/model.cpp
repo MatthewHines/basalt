@@ -430,8 +430,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 int global = 0;
                 for (const Visit& v : g.visits)
                     if (!g.swa[(size_t) v.layer]) global += 1;
-                const uint64_t elem = fp8_ ? 1 : 2;
-                const uint64_t per_pos = (uint64_t) global * 2ull * kKvHeads * kHeadDim * elem;
+                const uint64_t per_pos = (uint64_t) global * 2ull * kKvHeads * kv_cache_row_bytes(fp8_, int8_);
                 const uint64_t budget = free_b - spare - shared0 - full_e - plan_margin;
                 const uint64_t base_cost = (session_device_bytes(g, 0, fp8_, int8_, 0) +
                                             (dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess;
