@@ -87,8 +87,9 @@ Flow Runtime::dispatch() {
             if (!pe.empty()) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
             if (!parking) break;
         }
-        // The wait for the next line wakes once a second: an engine that parks nothing (inkling2) or runs batch slots
-        // reaches no other idle moment while the pipe is quiet, and the wall clock needs waking to fire the S2 retire.
+        // The wait for the next line wakes once per second: an engine with nothing to park, or one running
+        // batch slots, reaches no other idle moment while the pipe is quiet, and the wall clock needs waking
+        // to fire the S2 retire. (Model names must not appear in the shared serve layer — model_layering.)
         // EOF unwinds exactly as the plain next_line did.
         if (!got) {
             for (;;) {
