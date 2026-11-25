@@ -69,6 +69,8 @@ public:
     // S2 (retire) law: once a retired boundary exists, new growth lands on DEVICE again, so device bytes need not
     // be a prefix — a retires-side must read these runs, not infer the region from host_start().
     std::vector<std::pair<uint64_t, uint64_t>> device_runs() const;
+    // The host-backed runs, same shape and merge rule — a wake re-warm reads these (S2 R4).
+    std::vector<std::pair<uint64_t, uint64_t>> host_runs() const;
     uint64_t granularity() const { return gran_; }   // the array's own RECOMMENDED granularity (VMM at open)
     uint64_t capacity() const { return extents_limit_; }
     uint64_t host_start() const { return host_start_; }

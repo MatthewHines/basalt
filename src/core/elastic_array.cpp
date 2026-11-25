@@ -83,6 +83,16 @@ std::vector<std::pair<uint64_t, uint64_t>> ElasticArray::device_runs() const {
     return runs;
 }
 
+std::vector<std::pair<uint64_t, uint64_t>> ElasticArray::host_runs() const {
+    std::vector<std::pair<uint64_t, uint64_t>> runs;
+    for (const auto& [off, e] : extents_) {
+        if (!e.host) continue;
+        if (!runs.empty() && runs.back().first + runs.back().second == off) runs.back().second += e.bytes;
+        else runs.push_back({off, e.bytes});
+    }
+    return runs;
+}
+
 void ElasticArray::recompute_host_start() {
     host_start_ = kNoHost;
     for (const auto& [off, e] : extents_) {

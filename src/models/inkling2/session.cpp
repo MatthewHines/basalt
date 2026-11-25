@@ -384,6 +384,7 @@ public:
         if (!ensure_positions(r.pos + r.n_tokens, err)) return {model::Status::Refused, "inkling2: " + err};
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
         const Admitted held{*this};
+        rewarm_incoming(r.pos, r.pos + r.n_tokens);   // S2 R4: the span comes home before the first token
         hist_.resize((size_t) r.pos);
         for (int t0 = 0; t0 < r.n_tokens; t0 += kMaxRows) {
             const int n = std::min(kMaxRows, r.n_tokens - t0);
@@ -416,7 +417,45 @@ protected:
     int64_t batch_context() const override { return m_.context(); }
     model::BatchShared& batch_shared() override { return sh_->batch; }
     cudaStream_t batch_stream() const override { return stream_; }
-    bool batch_reserve(const model::DecodeRequest& r, std::string& err) override { return ensure_positions(r.pos + r.n_tokens, err); }
+    bool batch_reserve(const model::DecodeRequest& r, std::string& err) override {
+        if (!ensure_positions(r.pos + r.n_tokens, err)) return false;
+        rewarm_incoming(r.pos, r.pos + r.n_tokens);   // S2 R4: the span comes home before the first token
+        return true;
+    }
+    // S2 wake re-warm (R4, spans only): the incoming span comes back to the card BEFORE the first token.
+    // Reads host_runs() (mirror law of the retire): host bytes are whatever the extent table says, never a
+    // region inferred from host_start(). Span = [pos_lo, pos_hi + one step), capped at the context; ends on
+    // the grid; moves only as far as the card affords WITHOUT touching the grow floor (held_free law, same
+    // as ensure). A refused move is fine — the cell stays host-backed and reads at host speed, and the next
+    // request tries again. Re-warming an already-warm span is a cheap no-op (no host runs intersect), so the
+    // call sites do not gate on retired state — the extent table is the truth. History re-warm is OQ-3.
+    void rewarm_incoming(int64_t pos_lo, int64_t pos_hi) {
+        if (elastic_.empty() || pos_hi <= pos_lo) return;
+        const int64_t hi = std::min<int64_t>(m_.context(), pos_hi + kElasticKvStep);
+        const uint64_t cb = cell_bytes();
+        uint64_t moved = 0;
+        size_t free0 = 0, total = 0;
+        cudaMemGetInfo(&free0, &total);
+        for (auto& a : elastic_) {
+            const uint64_t gran = a->granularity();
+            if (gran == 0) continue;   // plain fallback arrays: no granules, nothing to move (same law as retire)
+            const uint64_t s_lo = (uint64_t)pos_lo * cb, s_hi = (uint64_t)hi * cb;
+            for (const auto& [off, bytes] : a->host_runs()) {
+                const uint64_t s = std::max(off, s_lo / gran * gran);
+                const uint64_t e = std::min(off + bytes, (s_hi + gran - 1) / gran * gran);
+                if (e <= s) continue;
+                const core::MoveResult r = a->rehome(s, e - s, m_.held_free(kElasticKeep));
+                moved += r.moved * gran;   // moved counts granules; a refusal mid-way still moved what it could
+            }
+        }
+        if (moved) {
+            size_t free1 = 0;
+            cudaMemGetInfo(&free1, &total);
+            basalt::log::info("inkling2", "kv warm: %.2f GiB of this lane's cache returned to the card (span %lld cells, %.2f -> %.2f GiB free)",
+                              (double)moved / (double)(1ull << 30), (long long)(hi - pos_lo),
+                              (double)free0 / (double)(1ull << 30), (double)free1 / (double)(1ull << 30));
+        }
+    }
     // S2 retire (R2/R3): the keep-warm window is the granule cell around the session's live high-water (live_top_) —
     // R3's "most recent cells", where a continuation reads and writes first. Everything else on the card retires:
     // the cold head below the window AND the dead slab above it (boot base, ensure margin). Once a retired boundary
@@ -515,6 +554,7 @@ public:
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the prompt runs past the context"};
         if (r.pos == 0) restart_positions(r.n_tokens);
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return {model::Status::Refused, "inkling2: " + e};
+        rewarm_incoming(r.pos, r.pos + r.n_tokens);   // S2 R4: the prompt span comes home before the first token
         hist_.resize((size_t) r.pos);
         if (sh_->prompt && r.n_tokens > 16) return sh_->prompt->read(r, hist_, vc_, dspark_, stream_);   // PROMPT HOOK
         std::string err;
@@ -548,6 +588,7 @@ public:
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
         if (pos + n_rows > m_.context()) return {model::Status::Refused, "inkling2: the picture runs past the context"};
         if (std::string e; !ensure_positions(pos + n_rows, e)) return {model::Status::Refused, "inkling2: " + e};
+        rewarm_incoming(pos, pos + n_rows);   // S2 R4: the picture's span comes home too
         hist_.resize((size_t) pos);
         if (sh_->prompt && n_rows > 16) return sh_->prompt->read_rows(rows, n_rows, pos, g_.image_token, hist_, vc_, dspark_, stream_);
         std::string err;
