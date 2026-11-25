@@ -454,7 +454,14 @@ protected:
                 // The same floor rehome enforces, checked here so a full card stays SILENT: a refused run would
                 // otherwise log 'floor failed' once per array per request — the swarm's normal state. A skipped
                 // piece stays host-backed, next request retries (the retry law is unchanged).
-                if ((uint64_t) free0 < (e - s) + m_.held_free(kElasticKeep)) continue;
+                // M4.2: headroom is re-read PER RUN, not once at entry — the floor-0 span is ~40x the old
+                // window, so the entry read goes stale the moment the cold-head run lands and the tail run
+                // then passes a check its bytes no longer fit (rehome's own floor refuses it, logging the
+                // 'floor failed' spam this pre-check exists to prevent). The retire shape is 2 runs per
+                // array, so one extra cudaMemGetInfo per candidate run is microscopic against the DMA.
+                uint64_t free_now = 0;
+                cudaMemGetInfo(&free_now, &total);
+                if (free_now < (e - s) + m_.held_free(kElasticKeep)) continue;
                 const core::MoveResult r = a->rehome(s, e - s, m_.held_free(kElasticKeep));
                 moved += r.moved * gran;   // moved counts granules; a refusal mid-way still moved what it could
             }
@@ -462,8 +469,11 @@ protected:
         if (moved) {
             size_t free1 = 0;
             cudaMemGetInfo(&free1, &total);
-            basalt::log::info("inkling2", "kv warm: %.2f GiB of this lane's cache returned to the card (span %lld cells, %.2f -> %.2f GiB free)",
-                              (double)moved / (double)(1ull << 30), (long long)(hi - pos_lo),
+            // M4.2 (R8 honest-log): report the cells ACTUALLY moved, not the requested window. Post-M4.1 the
+            // move spans [0, hi) while pos_lo only guards emptiness, so the old 'hi - pos_lo' under-reported
+            // every continuation wake (observed '0.31 GiB ... (span 8193 cells)').
+            basalt::log::info("inkling2", "kv warm: %.2f GiB of this lane's cache returned to the card (moved %lld cells, %.2f -> %.2f GiB free)",
+                              (double)moved / (double)(1ull << 30), (long long)(moved / cb),
                               (double)free0 / (double)(1ull << 30), (double)free1 / (double)(1ull << 30));
         }
     }
