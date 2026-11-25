@@ -87,24 +87,22 @@ uint64_t shared_bytes(const Geometry& g, bool drafter) {
     return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kDecodeRows, kPromptChunk)) : 0);   // PROMPT, DSPARK HOOKS
 }
 
-uint64_t session_device_bytes(const Geometry& g, int64_t context, bool fp8, int64_t resident) {
-    if (resident <= 0 || resident >= context) return session_bytes(g, context, fp8);
+uint64_t session_device_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int64_t resident) {
+    if (resident <= 0 || resident >= context) return session_bytes(g, context, fp8, int8, 0, 0);
     int global = 0;
     for (const Visit& v : g.visits)
         if (!g.swa[(size_t) v.layer]) global += 1;
-    const uint64_t elem = fp8 ? 1 : 2;
-    const uint64_t per_pos = 2ull * kKvHeads * kHeadDim * elem;
+    const uint64_t per_pos = 2ull * kKvHeads * kv_cache_row_bytes(fp8, int8);   // upstream's own per-layer accounting
     // the cells past the resident bound home in RAM: the plan charges the card only its share
-    return session_bytes(g, context, fp8) - (uint64_t) global * per_pos * (uint64_t) (context - resident);
+    return session_bytes(g, context, fp8, int8, 0, 0) - (uint64_t) global * per_pos * (uint64_t) (context - resident);
 }
 
-uint64_t session_host_bytes(const Geometry& g, int64_t context, bool fp8, int64_t resident) {
+uint64_t session_host_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int64_t resident) {
     if (resident <= 0 || resident >= context) return 0;
     int global = 0;
     for (const Visit& v : g.visits)
         if (!g.swa[(size_t) v.layer]) global += 1;
-    const uint64_t elem = fp8 ? 1 : 2;
-    const uint64_t per_pos = 2ull * kKvHeads * kHeadDim * elem;
+    const uint64_t per_pos = 2ull * kKvHeads * kv_cache_row_bytes(fp8, int8);
     return (uint64_t) global * per_pos * (uint64_t) (context - resident);
 }
 
@@ -401,9 +399,6 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         if (kv_res_ > 0) elastic_ = true;   // the sessions' full caches become elastic arrays with a host tail
         const uint64_t spare = std::max<uint64_t>(kCardSpare, (uint64_t) std::max(req.vram_reserve_mib, 0) << 20) - vision_modules;   // [vision] the desktop's floor rides in the plan too, as qwen35's does
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
-        const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
-            return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
-        };
         // [all experts first] when the session's resident slice cannot hold the asked context, the experts are
         // never evicted -- the slice shrinks instead and the tail streams in host RAM. This is the only place
         // bytes_dev is computed from a free-room reading, so it must run before the plan below.
@@ -426,7 +421,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
             if (full_e + spare >= free_b)
                 return fail("inkling2: the full expert tables (" + std::to_string(full_e >> 20) + " MiB) leave no room for a session even with no KV: --max-context " + std::to_string(want) + " does not fit, free " + std::to_string(free_b >> 20) + " MiB");
             const uint64_t shared0 = shared_bytes(g, dspark_ != nullptr);   // the scratch every slot shares, charged once
-            const uint64_t want_full = full_e + (session_device_bytes(g, want, fp8_, 0) +
+            const uint64_t want_full = full_e + (session_device_bytes(g, want, fp8_, int8_, 0) +
                                                  (dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess + shared0 + spare;
             // the same margin the spill plan keeps: the driver's rounding on the per-layer allocations lands after the plan.
             // Without it the check below rejects a plan this block made — an exact fit is a coin flip, not a fit.
@@ -438,7 +433,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 const uint64_t elem = fp8_ ? 1 : 2;
                 const uint64_t per_pos = (uint64_t) global * 2ull * kKvHeads * kHeadDim * elem;
                 const uint64_t budget = free_b - spare - shared0 - full_e - plan_margin;
-                const uint64_t base_cost = (session_device_bytes(g, 0, fp8_, 0) +
+                const uint64_t base_cost = (session_device_bytes(g, 0, fp8_, int8_, 0) +
                                             (dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess;
                 if (budget <= base_cost)
                     return fail("inkling2: the full expert tables (" + std::to_string(full_e >> 20) + " MiB) leave no room for a session's rings and scratch; free " + std::to_string(budget >> 20) + " MiB");
@@ -455,9 +450,9 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         }
         if (kv_res_ > 0)
             basalt::log::info("basalt inkling2", "K/V streaming: %lld of %lld cells per layer in VRAM, %.2f GiB in page-locked RAM per slot (the drafter's caches stay on the card)",
-                              (long long) kv_res_, (long long) want, (double) session_host_bytes(g, want, fp8_, kv_res_) / (double) kGiB);
+                              (long long) kv_res_, (long long) want, (double) session_host_bytes(g, want, fp8_, int8_, kv_res_) / (double) kGiB);
         const auto bytes_dev = [&](int64_t c) {   // the card's share (DSPARK HOOK: the drafter rides beside it, always resident)
-            return session_device_bytes(g, c, fp8_, kv_res_) +
+            return session_device_bytes(g, c, fp8_, int8_, kv_res_) +
                    (dspark_ ? dspark_session_bytes(pack_, c) : 0);
         };
         const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
