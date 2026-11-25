@@ -433,11 +433,15 @@ protected:
         std::string last;
         for (auto& a : elastic_) {
             const uint64_t gran = a->granularity();   // the array's own VMM granularity: the alignment law
+            if (gran == 0) continue;   // a plain cudaMalloc fallback array has no granules (VMM absent): it cannot retire by granule (review F4)
             const uint64_t cb = cell_bytes();
             const uint64_t live = (uint64_t) std::max<int64_t>(live_top_, 0) * cb;
             const uint64_t keep = keep_warm_cells > 0 ? (uint64_t) keep_warm_cells * cb : 0;
+            // The window ends at max(live, keep): a live top below the keep length still keeps its opening
+            // warm — a lane that has not run yet is where a new conversation writes first (review F3).
+            const uint64_t hi = std::max(live, keep);
             const uint64_t w_lo = live > keep ? (live - keep) / gran * gran : 0;
-            const uint64_t w_hi = ((live + gran - 1) / gran) * gran;   // the granule holding the live top stays warm
+            const uint64_t w_hi = (hi + gran - 1) / gran * gran;   // ceil to the grid
             for (const auto& [off, bytes] : a->device_runs()) {
                 const uint64_t end = off + bytes;
                 const uint64_t end_a = end / gran * gran;   // spans end on the grid; a short piece stays device-backed
@@ -691,6 +695,10 @@ public:
             for (auto& a : elastic_) a->trim(cell_bytes() * (uint64_t) keep);
             backed_ = std::min<int64_t>(backed_, (int64_t) (elastic_[0]->backed() / cell_bytes()));
         }
+        // S2.2: a restart is a NEW conversation — the old one's live tail is no one's future. The high-water
+        // resets and the next ensure_positions raises it again; a stale mark would anchor the keep-warm window
+        // over dead cells (review F2/S2-1).
+        live_top_ = 0;
         if (m_.promoted() < m_.spill().spilled && !m_.lent()) {
             cudaStreamSynchronize(stream_);
             m_.promote(m_.held_free(kElasticKeep) + (uint64_t) elastic_.size() * cell_bytes() * (uint64_t) std::max<int64_t>(0, keep - backed_));
