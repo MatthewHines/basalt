@@ -99,7 +99,6 @@ Flow Request::complete() {
             BSlot& sl = runtime_.bs[(size_t) runtime_.admit_slot];
             sl = BSlot{};
             sl.active = true;
-            runtime_.kv_note_wake((size_t) runtime_.admit_slot);   // S2: a retired lane waking starts its flap guard (warming is M3)
             sl.pen_n = req_sp.penalty_last_n;
             slot_init(sl);
             sl.x = x;

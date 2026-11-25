@@ -247,22 +247,27 @@ void Runtime::retire_idle_lanes() {
     }
 }
 
-void Runtime::kv_note_activity(const std::string&) {
-    if (o.kv_idle_demote_seconds <= 0 || batch_on()) return;   // batch lanes are clocked at their slot's start and end
-    kv_line_busy = true;
-    if (!kv_pol.empty() && kv_pol[0].retired)
-        basalt::core::kv_policy_note_wake(kv_secs(Clock::now()), kv_conf(o), kv_pol[0]);
+void Runtime::kv_note_activity(const std::string& line) {
+    if (o.kv_idle_demote_seconds <= 0) return;
+    // The line carries the reader-rewritten forms: GEN names the solo lane; SGEN/BGEN (and their I variants)
+    // name their slot. A retired lane's wake is the ARRIVAL of its request: the lane that gets work starts its
+    // flap guard and clock — never lane 0 by default.
+    size_t lane;
+    if (line.rfind("GEN ", 0) == 0) lane = 0;
+    else if (line.rfind("SGEN", 0) == 0 || line.rfind("BGEN", 0) == 0) {
+        const char* p = line.c_str() + 4;
+        if (*p == 'I') ++p;   // SGENI/BGENI: the interleaved variants carry the same slot field
+        lane = (size_t) std::atoi(p);
+    } else return;
+    if (lane >= kv_pol.size()) return;
+    if (lane == 0 && !batch_on()) kv_line_busy = true;   // the solo clock closes its busy edge at the next idle tick
+    if (kv_pol[lane].retired)
+        basalt::core::kv_policy_note_wake(kv_secs(Clock::now()), kv_conf(o), kv_pol[lane]);
 }
 
 void Runtime::kv_stamp_idle(size_t lane) {
     if (o.kv_idle_demote_seconds <= 0 || lane >= kv_idle_at.size()) return;
     kv_idle_at[lane] = Clock::now();
-}
-
-void Runtime::kv_note_wake(size_t lane) {
-    if (o.kv_idle_demote_seconds <= 0 || lane >= kv_pol.size()) return;
-    if (kv_pol[lane].retired)
-        basalt::core::kv_policy_note_wake(kv_secs(Clock::now()), kv_conf(o), kv_pol[lane]);
 }
 
 }  // namespace basalt::program::serve

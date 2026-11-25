@@ -409,36 +409,47 @@ protected:
     model::BatchShared& batch_shared() override { return sh_->batch; }
     cudaStream_t batch_stream() const override { return stream_; }
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override { return ensure_positions(r.pos + r.n_tokens, err); }
-    // S2 retire (R2/R3): every array's device backing moves to host backing down to the keep-warm window. The arrays'
-    // front doors consume the sync hook above, so nothing moves over a running window; a bracket that sticks is the
-    // array's to repair at the next gate (S1 law), never fatal here — freed counts only what moved.
+    // S2 retire (R2/R3): the keep-warm window is the granule cell around the session's live high-water (live_top_) —
+    // R3's "most recent cells", where a continuation reads and writes first. Everything else on the card retires:
+    // the cold head below the window AND the dead slab above it (boot base, ensure margin). Once a retired boundary
+    // exists new growth lands on device again, so the device bytes are whatever runs the extent table says
+    // (device_runs) — never infer the region from host_start(). The arrays' front doors consume the sync hook above,
+    // so nothing moves over a running window; a bracket that sticks is the array's to repair at the next gate
+    // (S1 law), never fatal here — freed counts only what moved.
     bool kv_retire(int64_t keep_warm_cells, uint64_t& freed_bytes, std::string& err) override {
         freed_bytes = 0;
         if (elastic_.empty()) return true;   // no elastic KV: nothing to retire
-        const uint64_t gran = 2ull << 20;    // granule law: retire spans are granule-aligned
-        const uint64_t keep = keep_warm_cells > 0 ? (uint64_t) keep_warm_cells * cell_bytes() / gran * gran : 0;
         size_t free0 = 0, total = 0, free1 = 0;
         cudaMemGetInfo(&free0, &total);
         int candidates = 0, failed = 0;
         std::string last;
         for (auto& a : elastic_) {
-            // The device region ends at host_start when there is a host tail, and at the backed end for an
-            // all-device array (host_start is the kNoHost sentinel there). Moves are granule-aligned law:
-            // retire to the granule floor; a sub-granule device piece, if any, simply stays device-backed.
-            const uint64_t hs = a->host_start();
-            const uint64_t dev_end = hs == core::ElasticArray::kNoHost ? a->backed() : hs;
-            const uint64_t hi = dev_end / gran * gran;
-            if (hi <= keep) continue;   // already retired to the window (or the remainder is one short piece)
-            ++candidates;
-            const core::MoveResult r = a->rehomes_down(keep, hi - keep);
-            freed_bytes += r.moved * gran;   // moved counts granules; a move refused mid-way still moved what it could
-            if (!r.reason.empty() && r.reason != "moved") { ++failed; last = r.reason; continue; }
+            const uint64_t gran = a->granularity();   // the array's own VMM granularity: the alignment law
+            const uint64_t cb = cell_bytes();
+            const uint64_t live = (uint64_t) std::max<int64_t>(live_top_, 0) * cb;
+            const uint64_t keep = keep_warm_cells > 0 ? (uint64_t) keep_warm_cells * cb : 0;
+            const uint64_t w_lo = live > keep ? (live - keep) / gran * gran : 0;
+            const uint64_t w_hi = ((live + gran - 1) / gran) * gran;   // the granule holding the live top stays warm
+            for (const auto& [off, bytes] : a->device_runs()) {
+                const uint64_t end = off + bytes;
+                const uint64_t end_a = end / gran * gran;   // spans end on the grid; a short piece stays device-backed
+                // two spans per run: the cold head below the window and the dead slab above it; either may be empty
+                for (const auto& [s, e] : { std::pair<uint64_t, uint64_t>{off, std::min(end_a, w_lo)},
+                                            std::pair<uint64_t, uint64_t>{std::max(off, w_hi), end_a} }) {
+                    if (e <= s) continue;
+                    ++candidates;
+                    const core::MoveResult r = a->rehomes_down(s, e - s);
+                    freed_bytes += r.moved * gran;   // moved counts granules; a move refused mid-way still moved what it could
+                    if (!r.reason.empty() && r.reason != "moved") { ++failed; last = r.reason; continue; }
+                }
+            }
         }
         cudaMemGetInfo(&free1, &total);
-        basalt::log::info("basalt inkling2", "kv retire: %.2f GiB of this lane's cache moved to host backing (%lld warm cells "
-                          "kept, %.2f -> %.2f GiB free%s)", (double) freed_bytes / (double) (1ull << 30), (long long) keep_warm_cells,
-                          (double) free0 / (double) (1ull << 30), (double) free1 / (double) (1ull << 30),
-                          failed ? "; some arrays refused - the next gate repairs them" : "");
+        if (candidates > 0)
+            basalt::log::info("basalt inkling2", "kv retire: %.2f GiB of this lane's cache moved to host backing (%lld warm cells "
+                              "kept, %.2f -> %.2f GiB free%s)", (double) freed_bytes / (double) (1ull << 30), (long long) keep_warm_cells,
+                              (double) free0 / (double) (1ull << 30), (double) free1 / (double) (1ull << 30),
+                              failed ? "; some arrays refused - the next gate repairs them" : "");
         if (candidates > 0 && freed_bytes == 0 && failed == candidates) { err = last.empty() ? "every array refused the retire" : last; return false; }
         return true;
     }
@@ -619,6 +630,7 @@ public:
     static constexpr int64_t kElasticKvStep = 8192;
     static constexpr uint64_t kElasticKeep = 512ull << 20;   // free bytes a grow leaves (the driver, the graphs)
     bool ensure_positions(int64_t positions, std::string& err) {
+        if (positions > live_top_) live_top_ = positions;   // S2 (R3): the live tail, in cells, is what keep-warm keeps
         if (elastic_.empty() || positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
         const uint64_t bytes = cell_bytes() * (uint64_t) target;
@@ -1367,6 +1379,7 @@ private:
     std::vector<uint32_t> tally_h_;
     ResidentExpertMap map_;
     int64_t lookups_ = 0;                    // decode's routed lookups so far
+    int64_t live_top_ = 0;                   // S2 (R3): furthest position this session has ever reserved (cells)
     // the elastic KV (model.hpp elastic()): the full visits' caches back their first backed_ cells
     std::vector<std::unique_ptr<core::ElasticArray>> elastic_;
     int64_t backed_ = 0;

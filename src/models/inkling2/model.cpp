@@ -394,6 +394,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         if (kv_idle_s_ < 0) return fail("--kv-idle-demote-seconds must be >= 0");
         kv_keep_warm_ = req.kv_keep_warm_cells;
         if (kv_keep_warm_ < 0) return fail("--kv-keep-warm-cells must be >= 0");
+        if (kv_keep_warm_ > want) return fail("--kv-keep-warm-cells cannot exceed the context (" + std::to_string(want) + " cells)");
         if (kv_res_ >= want) kv_res_ = 0;   // every cell stays on the card anyway: off
         if (kv_res_ > 0 && cut_ > 0) return fail("inkling2: --kv-resident is one card; the layer split keeps every cache on its card");
         if (kv_res_ > 0 && !core::vmm::supported()) return fail("inkling2: --kv-resident needs virtual memory management");

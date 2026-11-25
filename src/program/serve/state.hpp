@@ -368,9 +368,8 @@ public:
     bool batch_on();
     // S2 retire: the loop's idle moments call these (definitions in commands.cpp)
     void retire_idle_lanes();                        // every lane whose quiet period passed hands its cache to host backing
-    void kv_note_activity(const std::string& line);  // a generation line is the solo lane's activity edge
+    void kv_note_activity(const std::string& line);  // an arriving generation line wakes the lane it names (R5 edge)
     void kv_stamp_idle(size_t lane);                 // the lane's run ended, now
-    void kv_note_wake(size_t lane);                  // a run starts on a retired lane (bookkeeping; warming is M3)
     bool try_next_line(std::string& out);
 };
 
