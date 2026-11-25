@@ -83,13 +83,28 @@ Flow Runtime::dispatch() {
             while (!got && !(got = try_next_line(line)) && disk.enabled() && spill_to_disk(false, 1) > 0) {}
             if (got) break;
             parking = parking && park_idle_engine(pe);
+            retire_idle_lanes();   // S2: lanes quiet past the threshold hand their caches to host backing (never fatal)
             if (!pe.empty()) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
             if (!parking) break;
         }
-        if (!got && !next_line(line)) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
+        // The wait for the next line wakes once a second: an engine that parks nothing (inkling2) or runs batch slots
+        // reaches no other idle moment while the pipe is quiet, and the wall clock needs waking to fire the S2 retire.
+        // EOF unwinds exactly as the plain next_line did.
+        if (!got) {
+            for (;;) {
+                const int r = next_line_within(line, 1000);
+                if (r == 1) break;
+                if (r < 0) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
+                retire_idle_lanes();   // S2: lanes quiet past the threshold hand their caches to host backing (never fatal)
+            }
+        }
     }
     // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
     // request's prompt and first token as a GEN 1, then continues it in that slot
+    // S2: a generation line is the solo lane's activity edge (batch lanes are clocked at their slot's start and end)
+    if (line.rfind("GEN", 0) == 0 || line.rfind("SGENT ", 0) == 0 || line.rfind("BGENT ", 0) == 0 ||
+        line.rfind("PROMPT ", 0) == 0)
+        kv_note_activity(line);
     if (line.rfind("BSTOP ", 0) == 0) {
         const int b = std::atoi(line.c_str() + 6);
         if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
@@ -190,6 +205,64 @@ Flow Runtime::dispatch() {
     } busy_scope;
     const BusyClock busy(busy_s, busy_on, busy_from);
     return run_request();
+}
+
+// ---- S2 idle-lane KV retire (S2-DESIGN R1/R2). The loop's idle moment calls retire_idle_lanes(); the wall clock
+// makes every decision and the moment only wakes it. Retiring is a speed bonus for the rest of the card, never
+// fatal: a refusal logs and the next tick tries again (the arrays repair their own stuck entries at the gate, S1).
+namespace {
+uint64_t kv_secs(Clock::time_point t) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::seconds>(t.time_since_epoch()).count();
+}
+basalt::core::KvPolicyConf kv_conf(const basalt::program::CommonOptions& o) {
+    return {(uint64_t) o.kv_idle_demote_seconds, (uint64_t) o.kv_keep_warm_cells};
+}
+}  // namespace
+
+void Runtime::retire_idle_lanes() {
+    if (o.kv_idle_demote_seconds <= 0) return;   // R7: off is exactly today's loop
+    const size_t n = (size_t) std::max(o.batch, 1);
+    if (kv_pol.size() != n) {   // boot (or the batch size's first use): every lane has been idle since now
+        kv_pol.clear(); kv_pol.resize(n);
+        kv_idle_at.assign(n, Clock::now());
+    }
+    const basalt::core::KvPolicyConf conf = kv_conf(o);
+    const Clock::time_point now = Clock::now();
+    const uint64_t now_s = kv_secs(now);
+    if (!batch_on() && kv_line_busy) { kv_line_busy = false; kv_idle_at[0] = now; }   // a solo run ended between lines; this tick closes its clock
+    for (size_t i = 0; i < n; ++i) {
+        const bool busy = batch_on() && i < bs.size() && bs[i].active;
+        if (basalt::core::kv_policy_decide(now_s, busy, kv_secs(kv_idle_at[i]), conf, kv_pol[i]) != basalt::core::KvAction::Retire)
+            continue;
+        uint64_t freed = 0;
+        std::string err;
+        if (!slot_session((int) i).kv_retire(o.kv_keep_warm_cells, freed, err)) {
+            basalt::log::info("basalt serve", "kv retire: lane %zu refused (%s); the next tick tries again", i, err.c_str());
+            continue;
+        }
+        basalt::core::kv_policy_note_retired(now_s, kv_pol[i]);
+        if (freed > 0)
+            basalt::log::info("basalt serve", "kv retire: lane %zu handed %.2f GiB of cache to host backing (%lld warm cells kept)",
+                              i, (double) freed / (double) (1ull << 30), (long long) o.kv_keep_warm_cells);
+    }
+}
+
+void Runtime::kv_note_activity(const std::string&) {
+    if (o.kv_idle_demote_seconds <= 0 || batch_on()) return;   // batch lanes are clocked at their slot's start and end
+    kv_line_busy = true;
+    if (!kv_pol.empty() && kv_pol[0].retired)
+        basalt::core::kv_policy_note_wake(kv_secs(Clock::now()), kv_conf(o), kv_pol[0]);
+}
+
+void Runtime::kv_stamp_idle(size_t lane) {
+    if (o.kv_idle_demote_seconds <= 0 || lane >= kv_idle_at.size()) return;
+    kv_idle_at[lane] = Clock::now();
+}
+
+void Runtime::kv_note_wake(size_t lane) {
+    if (o.kv_idle_demote_seconds <= 0 || lane >= kv_pol.size()) return;
+    if (kv_pol[lane].retired)
+        basalt::core::kv_policy_note_wake(kv_secs(Clock::now()), kv_conf(o), kv_pol[lane]);
 }
 
 }  // namespace basalt::program::serve

@@ -296,6 +296,7 @@ public:
                 const int64_t base_cells = m_.kv_resident() > 0 ? m_.kv_resident() : core::kElasticKvBase;
                 for (int j = 0; j < 2; ++j) {
                     auto a = std::make_unique<core::ElasticArray>();
+                    a->set_sync_hook(&Session::kv_sync_hook, this);   // S2 (R2): the front door moves only on a quiet stream
                     if (ok && (!a->open(bytes, err) || !a->ensure(cell_bytes() * (uint64_t) base_cells, 0, err) ||
                                (m_.kv_resident() > 0 && !a->back_host(bytes, err)))) ok = false;
                     (j ? c.v : c.k) = a->data();
@@ -408,6 +409,45 @@ protected:
     model::BatchShared& batch_shared() override { return sh_->batch; }
     cudaStream_t batch_stream() const override { return stream_; }
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override { return ensure_positions(r.pos + r.n_tokens, err); }
+    // S2 retire (R2/R3): every array's device backing moves to host backing down to the keep-warm window. The arrays'
+    // front doors consume the sync hook above, so nothing moves over a running window; a bracket that sticks is the
+    // array's to repair at the next gate (S1 law), never fatal here — freed counts only what moved.
+    bool kv_retire(int64_t keep_warm_cells, uint64_t& freed_bytes, std::string& err) override {
+        freed_bytes = 0;
+        if (elastic_.empty()) return true;   // no elastic KV: nothing to retire
+        const uint64_t gran = 2ull << 20;    // granule law: retire spans are granule-aligned
+        const uint64_t keep = keep_warm_cells > 0 ? (uint64_t) keep_warm_cells * cell_bytes() / gran * gran : 0;
+        size_t free0 = 0, total = 0, free1 = 0;
+        cudaMemGetInfo(&free0, &total);
+        int candidates = 0, failed = 0;
+        std::string last;
+        for (auto& a : elastic_) {
+            // The device region ends at host_start when there is a host tail, and at the backed end for an
+            // all-device array (host_start is the kNoHost sentinel there). Moves are granule-aligned law:
+            // retire to the granule floor; a sub-granule device piece, if any, simply stays device-backed.
+            const uint64_t hs = a->host_start();
+            const uint64_t dev_end = hs == core::ElasticArray::kNoHost ? a->backed() : hs;
+            const uint64_t hi = dev_end / gran * gran;
+            if (hi <= keep) continue;   // already retired to the window (or the remainder is one short piece)
+            ++candidates;
+            const core::MoveResult r = a->rehomes_down(keep, hi - keep);
+            freed_bytes += r.moved * gran;   // moved counts granules; a move refused mid-way still moved what it could
+            if (!r.reason.empty() && r.reason != "moved") { ++failed; last = r.reason; continue; }
+        }
+        cudaMemGetInfo(&free1, &total);
+        basalt::log::info("basalt inkling2", "kv retire: %.2f GiB of this lane's cache moved to host backing (%lld warm cells "
+                          "kept, %.2f -> %.2f GiB free%s)", (double) freed_bytes / (double) (1ull << 30), (long long) keep_warm_cells,
+                          (double) free0 / (double) (1ull << 30), (double) free1 / (double) (1ull << 30),
+                          failed ? "; some arrays refused - the next gate repairs them" : "");
+        if (candidates > 0 && freed_bytes == 0 && failed == candidates) { err = last.empty() ? "every array refused the retire" : last; return false; }
+        return true;
+    }
+    // The S1 sync-hook contract for this session's elastic arrays: a move asks for a quiet stream first.
+    static bool kv_sync_hook(void* ctx, std::string& err) {
+        if (cudaStreamSynchronize(static_cast<Session*>(ctx)->stream_) == cudaSuccess) return true;
+        err = "the session stream refused to sync";
+        return false;
+    }
     bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key& key, std::string& err) override {
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
         key.push_back(cpu_ = cpu_layers());

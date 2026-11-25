@@ -199,6 +199,7 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
                     std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
                     (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);
         sl.active = false;
+        kv_stamp_idle((size_t) b);   // S2: the lane's quiet clock starts at its request's end
         sl.cached = o.prompt_cache > 0;
         sl.idle_busy = busy_now();
         sl.guard.reset();
