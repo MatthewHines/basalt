@@ -434,8 +434,15 @@ protected:
             const uint64_t s_lo = (uint64_t)pos_lo * cb, s_hi = (uint64_t)hi * cb;
             for (const auto& [off, bytes] : a->host_runs()) {
                 const uint64_t s = std::max(off, s_lo / gran * gran);
-                const uint64_t e = std::min(off + bytes, (s_hi + gran - 1) / gran * gran);
+                // Both ends on the grid, MIRRORS of the retire law: a short piece at either end stays where it is
+                // (host). Floors off+bytes too — if the host granule ever differs, the tail piece stays host-backed
+                // instead of handing rehome a misaligned range it must loudly refuse on every request.
+                const uint64_t e = std::min((off + bytes) / gran * gran, (s_hi + gran - 1) / gran * gran);
                 if (e <= s) continue;
+                // The same floor rehome enforces, checked here so a full card stays SILENT: a refused run would
+                // otherwise log 'floor failed' once per array per request — the swarm's normal state. A skipped
+                // piece stays host-backed, next request retries (the retry law is unchanged).
+                if ((uint64_t) free0 < (e - s) + m_.held_free(kElasticKeep)) continue;
                 const core::MoveResult r = a->rehome(s, e - s, m_.held_free(kElasticKeep));
                 moved += r.moved * gran;   // moved counts granules; a refusal mid-way still moved what it could
             }
