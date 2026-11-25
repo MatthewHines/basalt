@@ -101,9 +101,10 @@ Flow Runtime::dispatch() {
     }
     // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
     // request's prompt and first token as a GEN 1, then continues it in that slot
-    // S2: a generation line is the solo lane's activity edge (batch lanes are clocked at their slot's start and end)
-    if (line.rfind("GEN", 0) == 0 || line.rfind("SGENT ", 0) == 0 || line.rfind("BGENT ", 0) == 0 ||
-        line.rfind("PROMPT ", 0) == 0)
+    // S2: a generation line is its lane's activity edge. The gate and kv_note_activity share ONE prefix set
+    // ("GEN", "SGEN", "BGEN" — the I image variants included): the reader rewrites GENT/SGENT/BGENT to those
+    // forms, so the *T literals here were dead and batch wakes were lost.
+    if (line.rfind("GEN", 0) == 0 || line.rfind("SGEN", 0) == 0 || line.rfind("BGEN", 0) == 0)
         kv_note_activity(line);
     if (line.rfind("BSTOP ", 0) == 0) {
         const int b = std::atoi(line.c_str() + 6);
@@ -253,7 +254,7 @@ void Runtime::kv_note_activity(const std::string& line) {
     // name their slot. A retired lane's wake is the ARRIVAL of its request: the lane that gets work starts its
     // flap guard and clock — never lane 0 by default.
     size_t lane;
-    if (line.rfind("GEN ", 0) == 0) lane = 0;
+    if (line.rfind("GEN", 0) == 0) lane = 0;   // GEN and GENI are the solo lane, whatever follows the verb
     else if (line.rfind("SGEN", 0) == 0 || line.rfind("BGEN", 0) == 0) {
         const char* p = line.c_str() + 4;
         if (*p == 'I') ++p;   // SGENI/BGENI: the interleaved variants carry the same slot field
