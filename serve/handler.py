@@ -321,6 +321,10 @@ def make_handler(target: Service | Router):
                 return self._stream_error(obj)
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
+            if code == 503:
+                # every 503 here is "unavailable for now" (GPU held, engine starting or dying):
+                # HTTP's own "wait this long" so a client queues politely instead of guessing.
+                self.send_header("Retry-After", "30")
             self.send_header("Content-Type", "application/json")
             self._cors()
             self.send_header("Content-Length", str(len(body)))
