@@ -659,6 +659,11 @@ public:
     // the base), and the RAM experts come back to the card while it has room.
     void restart_positions(int64_t positions) {
         if (elastic_.empty()) return;
+        // S2.2 (round 3): a restart is a NEW conversation — the old one's live tail is no one's future.
+        // The high-water resets here, BEFORE the resident branch returns: a stale mark would anchor the
+        // keep-warm window over dead cells in the resident config too, which is the default warm shape.
+        // The next ensure_positions raises the mark again.
+        live_top_ = 0;
         // streaming: the resident slice and the host tail are mapped by design and stay put — trimming the
         // resident extents here would unmap live cache (and the ensure path cannot re-map past the host boundary)
         if (m_.kv_resident() > 0) {
@@ -674,10 +679,6 @@ public:
             for (auto& a : elastic_) a->trim(cell_bytes() * (uint64_t) keep);
             backed_ = std::min<int64_t>(backed_, (int64_t) (elastic_[0]->backed() / cell_bytes()));
         }
-        // S2.2: a restart is a NEW conversation — the old one's live tail is no one's future. The high-water
-        // resets and the next ensure_positions raises it again; a stale mark would anchor the keep-warm window
-        // over dead cells (review F2/S2-1).
-        live_top_ = 0;
         if (m_.promoted() < m_.spill().spilled && !m_.lent()) {
             cudaStreamSynchronize(stream_);
             m_.promote(m_.held_free(kElasticKeep) + (uint64_t) elastic_.size() * cell_bytes() * (uint64_t) std::max<int64_t>(0, keep - backed_));
