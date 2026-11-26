@@ -68,6 +68,14 @@ public:
             o.kv_keep_warm_cells = std::atoll(args.next("--kv-keep-warm-cells"));
             return true;
         }
+        if (a == "--kv-keep-warm-adaptive") {   // S3-M1: band the keep target on measured pressure (switch)
+            o.kv_keep_warm_adaptive = true;
+            return true;
+        }
+        if (a == "--kv-adaptive-low-mib") {   // S3-M1: below reserve + this, a retire keeps nothing
+            o.kv_adaptive_low_mib = std::atoll(args.next("--kv-adaptive-low-mib"));
+            return true;
+        }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK
     }
 

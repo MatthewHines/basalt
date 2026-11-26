@@ -217,7 +217,8 @@ uint64_t kv_secs(Clock::time_point t) {
     return (uint64_t) std::chrono::duration_cast<std::chrono::seconds>(t.time_since_epoch()).count();
 }
 basalt::core::KvPolicyConf kv_conf(const basalt::program::CommonOptions& o) {
-    return {(uint64_t) o.kv_idle_demote_seconds, (uint64_t) o.kv_keep_warm_cells};
+    return {(uint64_t) o.kv_idle_demote_seconds, (uint64_t) o.kv_keep_warm_cells,
+            o.kv_keep_warm_adaptive, (uint64_t) std::max<int64_t>(o.kv_adaptive_low_mib, 0)};
 }
 }  // namespace
 
@@ -238,14 +239,33 @@ void Runtime::retire_idle_lanes() {
             continue;
         uint64_t freed = 0;
         std::string err;
-        if (!slot_session((int) i).kv_retire(o.kv_keep_warm_cells, freed, err)) {
+        // S3-M1: the adaptive rail bands the keep target on measured pressure; off, or an unmeasurable
+        // card, is exactly today's constant (fail-safe to the window band).
+        auto& sess = slot_session((int) i);
+        int64_t keep = o.kv_keep_warm_cells;
+        const char* band = "window";
+        uint64_t free_at_decide = 0;
+        if (conf.keep_warm_adaptive) {
+            uint64_t free_bytes = 0;
+            if (sess.kv_card_free(free_bytes)) {
+                free_at_decide = free_bytes;
+                const auto target = basalt::core::kv_keep_target(
+                    free_bytes, (uint64_t) std::max<int64_t>(o.vram_reserve_mib, 0) << 20,
+                    sess.kv_live_bytes(), conf);
+                if (target == basalt::core::KvKeep::Nothing) { keep = 0; band = "pressure"; }
+                else if (target == basalt::core::KvKeep::LiveOnly) { keep = -1; band = "room"; }
+            }
+        }
+        if (!sess.kv_retire(keep, freed, err)) {
             basalt::log::info("basalt serve", "kv retire: lane %zu refused (%s); the next tick tries again", i, err.c_str());
             continue;
         }
         basalt::core::kv_policy_note_retired(now_s, kv_pol[i]);
         if (freed > 0)
-            basalt::log::info("basalt serve", "kv retire: lane %zu handed %.2f GiB of cache to host backing (%lld warm cells kept)",
-                              i, (double) freed / (double) (1ull << 30), (long long) o.kv_keep_warm_cells);
+            basalt::log::info("basalt serve", "kv retire: lane %zu handed %.2f GiB of cache to host backing "
+                              "(band %s, %lld warm cells kept, %.2f GiB free at decide)",
+                              i, (double) freed / (double) (1ull << 30), band, (long long) keep,
+                              (double) free_at_decide / (double) (1ull << 30));
     }
 }
 

@@ -393,6 +393,10 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         kv_keep_warm_ = req.kv_keep_warm_cells;
         if (kv_keep_warm_ < 0) return fail("--kv-keep-warm-cells must be >= 0");
         if (kv_keep_warm_ > want) return fail("--kv-keep-warm-cells cannot exceed the context (" + std::to_string(want) + " cells)");
+        // S3-M1: refused loudly at load (the serve tick consumes the rail; the model does not band, so no storage).
+        if (req.kv_adaptive_low_mib < 0) return fail("--kv-adaptive-low-mib must be >= 0");
+        if (req.kv_keep_warm_adaptive && req.kv_idle_demote_seconds <= 0)
+            return fail("--kv-keep-warm-adaptive needs --kv-idle-demote-seconds > 0 (the rail rides the retire tick)");
         if (kv_res_ >= want) kv_res_ = 0;   // every cell stays on the card anyway: off
         if (kv_res_ > 0 && cut_ > 0) return fail("inkling2: --kv-resident is one card; the layer split keeps every cache on its card");
         if (kv_res_ > 0 && !core::vmm::supported()) return fail("inkling2: --kv-resident needs virtual memory management");

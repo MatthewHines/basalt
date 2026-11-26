@@ -109,6 +109,8 @@ struct LoadRequest {
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
     int64_t kv_idle_demote_seconds = 0;  ///< --kv-idle-demote-seconds: retire an idle lane's slice after N s (0: off; S2)
     int64_t kv_keep_warm_cells = 8192;   ///< --kv-keep-warm-cells: newest cells kept device-backed through a retire (S2)
+    bool kv_keep_warm_adaptive = false;  ///< --kv-keep-warm-adaptive: band the keep target on measured pressure (S3-M1)
+    int64_t kv_adaptive_low_mib = 1024;  ///< --kv-adaptive-low-mib: below reserve + this, a retire keeps nothing (S3-M1)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
 };
 
@@ -158,10 +160,17 @@ public:
     virtual int batch_rows() const { return 0; }
     /// S2 cache-stream management: retire this session's KV cache from the card down to `keep_warm_cells` position cells
     /// per array. The retired bytes stay readable (host backing, host speed); the VAs never move. Bytes freed.
+    /// S3-M1: `keep_warm_cells == -1` means keep the WHOLE live span (retire only the dead slab above live).
     /// Default: no elastic KV — there is nothing to retire.
     virtual bool kv_retire(int64_t keep_warm_cells, uint64_t& freed_bytes, std::string& err) {
         (void) keep_warm_cells; (void) err; freed_bytes = 0; return true;
     }
+    /// S3-M1: bytes this lane has actually reached (live positions x cell bytes); the adaptive rail prices
+    /// keeps with it. Default 0: no elastic KV, nothing live.
+    virtual uint64_t kv_live_bytes() const { return 0; }
+    /// S3-M1: measured FREE device bytes (the rail keeps CUDA out of the serve loop by asking the model,
+    /// which owns the device). False: cannot measure — the caller falls back to the configured window.
+    virtual bool kv_card_free(uint64_t& free_bytes) { (void) free_bytes; return false; }
     /// The windows reqs[0..n) of the distinct sessions[0..n) (sessions of one model, this one among them) as one batch, the
     /// model's weights read once: each session ends as after its own decode_window(reqs[i]). The windows' rows total at most
     /// batch_rows().

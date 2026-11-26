@@ -499,7 +499,9 @@ protected:
             if (gran == 0) continue;   // a plain cudaMalloc fallback array has no granules (VMM absent): it cannot retire by granule (review F4)
             const uint64_t cb = cell_bytes();
             const uint64_t live = (uint64_t) std::max<int64_t>(live_top_, 0) * cb;
-            const uint64_t keep = keep_warm_cells > 0 ? (uint64_t) keep_warm_cells * cb : 0;
+            // S3-M1: -1 keeps the WHOLE live span (the window becomes [0, live]; only the dead slab retires).
+            const uint64_t keep = keep_warm_cells < 0 ? live
+                              : keep_warm_cells > 0 ? (uint64_t) keep_warm_cells * cb : 0;
             // The window ends at max(live, keep): a live top below the keep length still keeps its opening
             // warm — a lane that has not run yet is where a new conversation writes first (review F3).
             const uint64_t hi = std::max(live, keep);
@@ -522,10 +524,21 @@ protected:
         cudaMemGetInfo(&free1, &total);
         if (candidates > 0)
             basalt::log::info("basalt inkling2", "kv retire: %.2f GiB of this lane's cache moved to host backing (%lld warm cells "
-                              "kept, %.2f -> %.2f GiB free%s)", (double) freed_bytes / (double) (1ull << 30), (long long) keep_warm_cells,
+                              "kept, %.2f -> %.2f GiB free%s)", (double) freed_bytes / (double) (1ull << 30),
+                              (long long) (keep_warm_cells < 0 ? std::max<int64_t>(live_top_, 0) : keep_warm_cells),   // S3-M1: -1 shows the live span it kept
                               (double) free0 / (double) (1ull << 30), (double) free1 / (double) (1ull << 30),
                               failed ? "; some arrays refused - the next gate repairs them" : "");
         if (candidates > 0 && freed_bytes == 0 && failed == candidates) { err = last.empty() ? "every array refused the retire" : last; return false; }
+        return true;
+    }
+    // S3-M1: the adaptive rail's two measurements, answered by the model that owns the device.
+    uint64_t kv_live_bytes() const override {
+        return (uint64_t) std::max<int64_t>(live_top_, 0) * cell_bytes();
+    }
+    bool kv_card_free(uint64_t& free_bytes) override {
+        size_t f = 0, t = 0;
+        if (cudaMemGetInfo(&f, &t) != cudaSuccess) return false;   // unmeasurable: the tick falls back to the window
+        free_bytes = f;
         return true;
     }
     // The S1 sync-hook contract for this session's elastic arrays: a move asks for a quiet stream first.

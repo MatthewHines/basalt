@@ -32,4 +32,13 @@ void kv_policy_note_retired(uint64_t, KvSlotPolicy& st) {
     st.retired = true;
 }
 
+KvKeep kv_keep_target(uint64_t free_bytes, uint64_t reserve_bytes, uint64_t live_bytes,
+                      const KvPolicyConf& conf) {
+    if (!conf.keep_warm_adaptive) return KvKeep::Window;   // off is exactly R3's constant
+    const uint64_t low = reserve_bytes + (conf.adaptive_low_mib << 20);
+    if (free_bytes < low) return KvKeep::Nothing;
+    if (free_bytes >= low + live_bytes) return KvKeep::LiveOnly;   // live 0 + room: keep nothing, dead slab goes
+    return KvKeep::Window;
+}
+
 }  // namespace basalt::core

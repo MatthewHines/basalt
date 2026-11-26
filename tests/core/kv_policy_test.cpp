@@ -9,6 +9,7 @@ using basalt::core::KvSlotPolicy;
 using basalt::core::kv_policy_decide;
 using basalt::core::kv_policy_note_retired;
 using basalt::core::kv_policy_note_wake;
+using basalt::core::kv_keep_target;
 
 static int fails = 0;
 static void check(bool ok, const char* what) {
@@ -70,6 +71,23 @@ int main() {
         kv_policy_note_retired(2000, st);
         kv_policy_note_wake(2100, c30, st);          // > 300 s after the previous wake
         check(is_retire(kv_policy_decide(2135, false, 2105, c30, st)), "window elapsed: single quiet period again (R1 clock rules)");
+    }
+
+    // S3-M1: the keep-target bands (pure arithmetic; the tick passes measured bytes).
+    {
+        KvPolicyConf a{}; a.idle_seconds = 30; a.keep_warm_adaptive = true; a.adaptive_low_mib = 1024;
+        using basalt::core::KvKeep;
+        const uint64_t reserve = 2048ull << 20, live = 600ull << 20;   // floor 2 GiB; a 600 MiB live lane
+        check(kv_keep_target(reserve, reserve, live, a) == KvKeep::Nothing, "at the floor: pressure keeps nothing");
+        check(kv_keep_target(reserve + (1024ull << 20) - 1, reserve, live, a) == KvKeep::Nothing, "one byte under LOW is pressure");
+        check(kv_keep_target(reserve + (1024ull << 20), reserve, live, a) == KvKeep::Window, "at LOW: today's window");
+        check(kv_keep_target(reserve + (1024ull << 20) + live, reserve, live, a) == KvKeep::LiveOnly, "LOW+live is room (>=)");
+        check(kv_keep_target(1ull << 40, reserve, live, a) == KvKeep::LiveOnly, "roomy keeps the live span, dead slab goes");
+        check(kv_keep_target(reserve, reserve, 0, a) == KvKeep::Nothing, "fresh lane at the floor: keep nothing");
+        check(kv_keep_target(reserve + (1024ull << 20), reserve, 0, a) == KvKeep::LiveOnly, "fresh lane with room: live span is nothing");
+        check(kv_keep_target(0, 0, 0, off) == KvKeep::Window, "off answers the window at any free reading");
+        KvPolicyConf off2{}; off2.keep_warm_adaptive = true;
+        check(kv_keep_target(0, 0, 0, off2) == KvKeep::Nothing, "on with a zero floor is pressure at zero free");
     }
 
     if (fails == 0) { std::printf("kv_policy_test: PASS\n"); return 0; }
