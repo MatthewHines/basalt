@@ -115,6 +115,12 @@ public:
         // whether the in-engine encoder reads video: FFmpeg found, for a model that reads the shared patches
         if (o.vision_in_engine && sessions_[0]->reads_patches()) std::printf("%s\n", basalt::vision::video_line().c_str());
         std::printf("INFO %s\n", (identity_words() + sessions_[0]->info_words()).c_str());
+        // The keep-warm rails' posture, once per boot (M4): the server republishes these under /v1/status, so an
+        // outside reader learns whether the bands are armed without parsing a command line.
+        if (o.kv_keep_warm_adaptive || o.kv_admit_negotiate)
+            std::printf("INFO kv_rails=1 kv_rails_adaptive=%d kv_rails_negotiate=%d kv_rails_low_mib=%lld\n",
+                        o.kv_keep_warm_adaptive ? 1 : 0, o.kv_admit_negotiate ? 1 : 0,
+                        (long long) o.kv_adaptive_low_mib);
         kv_ceiling_note();
         std::printf("READY %lld stop\n", (long long) o.max_context);
         std::fflush(stdout);

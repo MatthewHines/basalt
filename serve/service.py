@@ -997,6 +997,7 @@ class Service:
             "vram": dict((getattr(self.engine, "info", {}) or {}).get("vram") or {},
                          elastic=bool((getattr(self.engine, "info", {}) or {}).get("vram_elastic")),
                          **self.vram_state()),
+            "kv": kv_view(getattr(self.engine, "info", {}) or {}),
             "machine": {
                 "at": int(time.time()),
                 "gpu": {"name": name, "used_mib": scaled(hw.get("mem_used"), 2 ** 20),
@@ -1864,6 +1865,25 @@ def spill_of(info: dict) -> dict | None:
     """The experts only the file holds, from the engine's INFO words: {experts, total, bytes}, None when none are."""
     words = {k: info.pop(f"spill_{k}", None) for k in ("experts", "total", "bytes")}
     return words if isinstance(words["experts"], int) and words["experts"] > 0 else None
+
+
+def kv_view(info: dict) -> dict | None:
+    """The keep-warm rails' settled state (M4), read from the engine's INFO facts — never popped, the engine's
+    dict is shared. `rails` is the boot posture (None until the engine states it); `lanes` is one entry per
+    lane that has settled a band, in lane order (None while no lane has settled: fresh boot or dense traffic —
+    a band changes only at a settle point, so what is here is settled truth). A room band reports kept -1:
+    the live-span law, whose cell count is the lane's own live size."""
+    rails = {k[len("kv_rails_"):]: info[k] for k in ("kv_rails_adaptive", "kv_rails_negotiate", "kv_rails_low_mib")
+             if k in info}
+    lanes = []
+    for i in range(len(info)):
+        if f"kv{i}_band" not in info:
+            continue
+        lanes.append({"band": info[f"kv{i}_band"], "kept_cells": info.get(f"kv{i}_kept"),
+                      "moved_mib": info.get(f"kv{i}_moved_mib")})
+    if not rails and not lanes:
+        return None
+    return {"rails": rails or None, "lanes": lanes or None}
 
 
 def done_line(slot: int | None, prompt_total: int, generated: int, finish: str, cancelled: bool,

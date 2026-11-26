@@ -2,9 +2,21 @@
 #include "state.hpp"
 #include "../cli/tokens.hpp"
 
+#include <cstdio>
+
 namespace basalt::program::serve {
 
 namespace {
+// The machine-readable side of the keep-warm ledger (M4): printed at the same settle points as the human lines,
+// as `INFO` facts the server republishes under /v1/status. A lane's band changes only where these print, so the
+// status keys are settled truth, never a guess; kept -1 means the room band keeps the live span (live law).
+// The laws being reported are the engine's own — the tick's window/pressure band (M1) and
+// core::kv_negotiate_keeps (S3-M2) — each settled at its site; this helper only speaks what was decided.
+void kv_facts(size_t lane, const char* band, long long kept, uint64_t moved) {
+    std::printf("INFO kv%zu_band=%s kv%zu_kept=%lld kv%zu_moved_mib=%llu\n",
+                lane, band, lane, kept, lane, (unsigned long long) (moved >> 20));
+    std::fflush(stdout);
+}
 // the busy clock runs while a request or a batch window does
 struct BusyClock {
     double& total;
@@ -268,6 +280,7 @@ void Runtime::retire_idle_lanes() {
                           "%.2f GiB free at decide)",
                           i, band, (long long) keep, (double) freed / (double) (1ull << 30),
                           (double) free_at_decide / (double) (1ull << 30));
+        kv_facts(i, band, (long long) keep, freed);
     }
 }
 
@@ -331,6 +344,8 @@ void Runtime::prompt_closed(uint64_t handle) {
         return;
     }
     if (lane < kv_pol.size()) basalt::core::kv_policy_note_retired(kv_secs(Clock::now()), kv_pol[lane]);
+    // the band fact prints even when nothing moved: a pressured close is a settled state either way (M4)
+    kv_facts(lane, "pressure", 0, freed);
     if (freed == 0) return;   // the ledger's own doctrine: a pressured close that moves nothing says nothing
                               // (the resident shape's truth is exactly this line's silence; proof windows saw it speak once)
     uint64_t free_now = 0;
@@ -465,6 +480,10 @@ void Runtime::kv_negotiate_arrival(int slot, uint64_t max_new, const std::string
                             : act.band == basalt::core::KvKeep::LiveOnly ? "room" : "window",
                           (long long) act.keep_cells, (double) freed / (double) (1ull << 30),
                           (double) funded / (double) (1ull << 30));
+        kv_facts((size_t) act.id,
+                 act.band == basalt::core::KvKeep::Nothing ? "pressure"
+                                                          : act.band == basalt::core::KvKeep::LiveOnly ? "room" : "window",
+                 (long long) act.keep_cells, freed);
     }
 }
 
