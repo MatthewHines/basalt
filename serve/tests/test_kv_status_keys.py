@@ -14,7 +14,24 @@ from pathlib import Path
 from unittest import mock
 
 from serve.engine.process import ProcessEngine
+from serve.config import kv_rails_words
 from serve.service import kv_view
+
+RAILS = {"--kv-keep-warm-adaptive", "--kv-admit-negotiate", "--no-kv-keep-warm-adaptive", "--no-kv-admit-negotiate"}
+
+
+class RailsDefault(unittest.TestCase):
+    """M4's posture: the rails ride by default on any engine that has the flags, exactly as grammar words
+    default on — and the negation form is the explicit off, honored over the default."""
+
+    def test_advertised_rails_ride_unless_argv_already_speaks_them(self):
+        self.assertEqual(kv_rails_words(RAILS, []), ["--kv-keep-warm-adaptive", "--kv-admit-negotiate"])
+        self.assertEqual(kv_rails_words(RAILS, ["--kv-keep-warm-adaptive"]), ["--kv-admit-negotiate"])
+        self.assertEqual(kv_rails_words(RAILS, ["--no-kv-admit-negotiate"]), ["--kv-keep-warm-adaptive"])
+
+    def test_an_engine_without_the_flags_starts_byte_identical(self):
+        self.assertEqual(kv_rails_words({"--grammar", "--model"}, ["--model", "x"]), [])
+        self.assertEqual(kv_rails_words(None, []), [])      # blind probe: add nothing, guess nothing
 
 FAKE = r'''
 import sys

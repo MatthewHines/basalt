@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags,  # noqa: E402
-                          engine_flags_of, grammar_words, model_line, model_settings, sampling_defaults_from_config,
+                          engine_flags_of, grammar_words, kv_rails_words, model_line, model_settings, sampling_defaults_from_config,
                           sampling_items, shared_line, slot_share, slots_text, start_items, with_spec)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
@@ -274,12 +274,13 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         if a.grammar and not has_grammar:
             print(tagged("warning", "grammar is on but this engine has no --grammar; requests go without one"), flush=True)
         gwords = grammar_words(known)
+        rwords = kv_rails_words(known, engine_args(cfg))   # the rails' default-on posture (S3-M4)
         cdir = flag_value(engine_args(cfg), "--conversation-cache-dir")
         cmib = flag_value(engine_args(cfg), "--conversation-cache-disk-mib") or "0"
         if cdir and cmib != "0" and a.debug:
             print(tagged("disk", f"conversations={cdir} disk-mib={cmib}"), flush=True)
         # always built unloaded: the load itself is the lazy path's, started by the caller instead of by a request
-        engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
+        engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords + rwords, log=cfg.get("log"), env=env, lazy=True)
         if cfg.get("log"):                              # follow the engine's log file
             print(f"[server] engine log: {cfg['log']}", flush=True)
             echo_engine_line = engine_echo(engine)

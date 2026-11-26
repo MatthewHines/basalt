@@ -52,6 +52,16 @@ def grammar_words(known: set[str] | None) -> list[str]:
     return ["--grammar", "on"] if known is not None and "--grammar" in known else []
 
 
+def kv_rails_words(known: set[str] | None, args: list[str]) -> list[str]:
+    """The keep-warm rails' words (S3-M4): each switch the engine binary has and the model's argv does not already
+    speak — neither the plain form (already on) nor the `--no-` form (an explicit off). The rails are the intended
+    posture (the S3 program's endstate), and an engine without the flags starts byte-identical, as with grammar."""
+    if known is None:
+        return []
+    return [flag for flag in ("--kv-keep-warm-adaptive", "--kv-admit-negotiate")
+            if flag in known and flag not in args and "--no-" + flag[2:] not in args]
+
+
 def split_engine_extras(extras: list[str]) -> list[str]:
     """The unknown command-line words, which go to the engine as typed: it parses its own flags and their values.
     A `--flag=VALUE` word is split in two, as the engine has no `=` form. ValueError for a leading word that is not

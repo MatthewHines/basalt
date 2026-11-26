@@ -72,12 +72,20 @@ public:
             o.kv_keep_warm_adaptive = true;
             return true;
         }
+        if (a == "--no-kv-keep-warm-adaptive") {   // the honest off: serve defaults the rail on (S3-M4)
+            o.kv_keep_warm_adaptive = false;
+            return true;
+        }
         if (a == "--kv-adaptive-low-mib") {   // S3-M1: below reserve + this, a retire keeps nothing
             o.kv_adaptive_low_mib = std::atoll(args.next("--kv-adaptive-low-mib"));
             return true;
         }
         if (a == "--kv-admit-negotiate") {   // S3-M2: idle lanes fund a waking lane's declared growth (switch)
             o.kv_admit_negotiate = true;
+            return true;
+        }
+        if (a == "--no-kv-admit-negotiate") {   // the honest off: serve defaults the rail on (S3-M4)
+            o.kv_admit_negotiate = false;
             return true;
         }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK
