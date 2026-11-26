@@ -369,6 +369,7 @@ public:
     // S2 retire: the loop's idle moments call these (definitions in commands.cpp)
     void retire_idle_lanes();                        // every lane whose quiet period passed hands its cache to host backing
     void kv_note_activity(const std::string& line);  // an arriving generation line wakes the lane it names (R5 edge)
+    void kv_negotiate_arrival(int slot, uint64_t max_new, const std::string& rest);   // S3-M2: idle lanes fund the waking lane's declared growth (arrival, before the valve)
     void kv_stamp_idle(size_t lane);                 // the lane's run ended, now
     bool try_next_line(std::string& out);
 };

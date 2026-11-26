@@ -541,6 +541,14 @@ protected:
         free_bytes = f;
         return true;
     }
+    // S3-M2: the negotiation's two payer measurements: what one cell costs, and what this lane still
+    // holds device-backed (the retire moves exactly this pool's runs).
+    uint64_t kv_cell_bytes() const override { return cell_bytes(); }
+    uint64_t kv_backed_bytes() const override {
+        uint64_t b = 0;
+        for (const auto& a : elastic_) b += a->backed();
+        return b;
+    }
     // The S1 sync-hook contract for this session's elastic arrays: a move asks for a quiet stream first.
     static bool kv_sync_hook(void* ctx, std::string& err) {
         if (cudaStreamSynchronize(static_cast<Session*>(ctx)->stream_) == cudaSuccess) return true;

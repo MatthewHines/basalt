@@ -197,6 +197,7 @@ Flow Runtime::dispatch() {
         admit_slot = (int) b;
         admit_max_new = mn;
         line = std::string(bimg ? "GENI 1" : "GEN 1") + e2;
+        if (o.kv_admit_negotiate) kv_negotiate_arrival((int) b, (uint64_t) mn, line);
     }
     between_requests(line);
     if (line == "QUIT") return Flow::quit;
@@ -291,6 +292,130 @@ void Runtime::kv_note_activity(const std::string& line) {
 void Runtime::kv_stamp_idle(size_t lane) {
     if (o.kv_idle_demote_seconds <= 0 || lane >= kv_idle_at.size()) return;
     kv_idle_at[lane] = Clock::now();
+}
+
+// ---- S3-M2: admission negotiation. A waking slot declares its size (BGEN/SGEN lines carry max_new and the
+// prompt). If the card cannot fund that growth above the LOW floor, the IDLE lanes hand over warm bytes NOW,
+// each to its M1 band target and never below what the tick itself would keep. The order is the point: idle
+// keeps are cheap (host backing, read-keyed span wake); the relief valve - expert-cache demotion, paid inside
+// ensure() - is expensive and changes answers, not only speed. Silent when funded: nothing to do, nothing to say.
+void Runtime::kv_negotiate_arrival(int slot, uint64_t max_new, const std::string& rest) {
+    if (o.kv_idle_demote_seconds <= 0) return;   // the quiet clock is this law's substrate
+    const size_t n = (size_t) std::max(o.batch, 1);
+    // The tick's own lazy init needs an idle moment, and a busy batched line never offers one: initialize
+    // here too, or an arrival before the first tick is mute (observed 2026-11-26: pol 0 while slots were warm).
+    // The slot table is the truth at this instant: a non-active lane HAS been idle (the tick's own idle-moment
+    // init makes the same statement); an active lane's clock starts now, so a chunk mid-decode never pays.
+    if (kv_pol.size() != n) {
+        kv_pol.assign(n, basalt::core::KvSlotPolicy{});
+        const auto now = Clock::now();
+        kv_idle_at.assign(n, now - std::chrono::seconds(2));
+        for (size_t i = 0; i < n && i < bs.size(); ++i)
+            if (bs[i].active) kv_idle_at[i] = now;
+    }
+    if (slot < 0 || (size_t) slot >= n) return;
+    const uint64_t cb = slot_session(slot).kv_cell_bytes();
+    if (cb == 0) return;   // no elastic KV to negotiate about (or nothing reportable about its size)
+    size_t prompt_len = 0;
+    std::vector<int32_t> ids;
+    bool media = false;
+    {
+        const std::lock_guard<std::mutex> lk(gent_mu);
+        std::vector<std::string> toks;
+        for (size_t i = 0; i < rest.size() && toks.size() < 6;) {
+            while (i < rest.size() && rest[i] == ' ') ++i;
+            const size_t w0 = i;
+            while (i < rest.size() && rest[i] != ' ') ++i;
+            if (i > w0) toks.emplace_back(rest.substr(w0, i - w0));
+        }
+        // The batch form names its prompt "#<handle>[+<id>,...]" (process.py's wire law), among the request's
+        // keys. The ledger answers the prompt's true length.
+        const std::string* named = nullptr;
+        for (size_t t = 2; t < toks.size() && named == nullptr; ++t)
+            if (toks[t][0] == '#') named = &toks[t];
+        if (named != nullptr) {
+            const auto it = prompts.find(std::strtoull(named->c_str() + 1, nullptr, 10));
+            if (it != prompts.end()) { ids = it->second.ids; media = it->second.media; prompt_len = ids.size(); }
+        }
+        if (ids.empty()) {   // text form "GEN <mn> <nbytes> <text...>": the text's bytes bound the need
+            size_t spaces = 0, seen = 0;
+            for (char c : rest) { if (c == ' ') ++spaces; ++seen; }
+            prompt_len = seen > 1 ? spaces - 1 : 0;
+        }
+    }
+    // What costs nothing is what the arrival's lane ALREADY holds. The lane's own flag says "active" (this
+    // GEN just marked it), so idle_ids declines it — but its SPAN still backs the previous conversation, the
+    // same bytes PMATCH priced a moment ago. The ledger reads that span directly; the media law is PMATCH's
+    // own: a media conversation shares only an exact head, and a head shorter than its media span re-reads.
+    size_t reuse = 0;
+    if (!ids.empty() && (size_t) slot < bs.size() && bs[(size_t) slot].cached) {
+        const std::vector<int32_t>& held = bs[(size_t) slot].ids;
+        size_t head = 0;
+        const size_t lim = std::min(held.size(), prompt_len);
+        while (head < lim && held[head] == ids[head]) ++head;
+        if (!media) reuse = head;
+        else if (!ids.empty()) {
+            // the media spans are byte ranges of the PROMPT TEXT; without re-tokenizing, a media continuation
+            // is credited only what the spans cannot deny: a head the shared bytes certainly cover is rare —
+            // claim none, like PMATCH does for any conversation not sharing an exact head.
+            reuse = 0;
+        }
+    }
+    const long need_cells = std::max((long) prompt_len - (long) reuse, 0L) + (long) max_new + 64;
+    const uint64_t demand_bytes = (uint64_t) std::max(need_cells, 0L) * cb;
+    uint64_t free_bytes = 0;
+    if (!slot_session(slot).kv_card_free(free_bytes)) return;   // unmeasurable: the valve decides, as today
+    const basalt::core::KvPolicyConf conf = kv_conf(o);
+    const uint64_t reserve_bytes = (uint64_t) std::max<int64_t>(o.vram_reserve_mib, 0) << 20;
+    std::vector<basalt::core::KvNegLane> lanes;
+    const uint64_t now_s = kv_secs(Clock::now());
+    for (size_t i = 0; i < n; ++i) {
+        if ((int) i == slot) continue;
+        if (batch_on() && i < bs.size() && bs[i].active) continue;   // only idle lanes pay
+        if (now_s < kv_secs(kv_idle_at[i]) + 0.05) continue;   // mid-copy pays nothing; a FRESH idle is exactly the payer
+        auto& s = slot_session((int) i);
+        // The payer is the lane that still HOLDS device backing. The tick's band law is the other clock: a lane
+        // idle through the window's edge has ALREADY settled toward host (its wake is S2's read-keyed re-warm;
+        // the band's keep is all it holds). Both clocks act, neither twice: at the quiet gate the tick retires,
+        // mid-window (batch ON) an arrival negotiates. What each payer keeps is the band's to price — here, and
+        // in the pure law below — never guessed twice.
+        const uint64_t backed = s.kv_backed_bytes();
+        if (backed < (16ull << 20)) continue;   // settled (or near it): there is nothing here to hand over
+        lanes.push_back({(uint64_t) i, s.kv_live_bytes(), backed, cb});
+    }
+    uint64_t freed_est = 0;
+    const auto plan = basalt::core::kv_negotiate_keeps(free_bytes, reserve_bytes, demand_bytes, lanes,
+                                                       conf, freed_est);
+    if (plan.empty()) return;
+    const uint64_t low = reserve_bytes + (conf.adaptive_low_mib << 20);
+    basalt::log::info("basalt serve",
+                      "kv negotiate: slot %d wakes needing %.2f GiB, %.2f GiB free (%zu payers, est %.2f GiB)",
+                      slot, (double) demand_bytes / (double) (1ull << 30),
+                      (double) free_bytes / (double) (1ull << 30), plan.size(),
+                      (double) freed_est / (double) (1ull << 30));
+    uint64_t funded = 0;
+    for (const basalt::core::KvNegKeep& act : plan) {
+        if (free_bytes + funded >= demand_bytes + low) break;   // funded on MEASURED frees
+        auto& s = slot_session((int) act.id);
+        uint64_t freed = 0;
+        std::string err;
+        if (!s.kv_retire(act.keep_cells, freed, err)) {
+            basalt::log::info("basalt serve", "kv negotiate: payer %llu refused (%s); the valve covers it",
+                              (unsigned long long) act.id, err.c_str());
+            continue;
+        }
+        funded += freed;
+        if (act.id < kv_pol.size())
+            basalt::core::kv_policy_note_retired(now_s, kv_pol[(size_t) act.id]);   // the tick honors this retirement
+        basalt::log::info("basalt serve",
+                          "kv negotiate: lane %llu settled band %s (%lld warm cells kept, %.2f GiB handed over, "
+                          "funded %.2f GiB)",
+                          (unsigned long long) act.id,
+                          act.band == basalt::core::KvKeep::Nothing ? "pressure"
+                            : act.band == basalt::core::KvKeep::LiveOnly ? "room" : "window",
+                          (long long) act.keep_cells, (double) freed / (double) (1ull << 30),
+                          (double) funded / (double) (1ull << 30));
+    }
 }
 
 }  // namespace basalt::program::serve

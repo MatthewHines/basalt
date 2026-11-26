@@ -10,6 +10,9 @@ using basalt::core::kv_policy_decide;
 using basalt::core::kv_policy_note_retired;
 using basalt::core::kv_policy_note_wake;
 using basalt::core::kv_keep_target;
+using basalt::core::KvNegLane;
+using basalt::core::kv_negotiate_keeps;
+#include <vector>
 
 static int fails = 0;
 static void check(bool ok, const char* what) {
@@ -88,6 +91,38 @@ int main() {
         check(kv_keep_target(0, 0, 0, off) == KvKeep::Window, "off answers the window at any free reading");
         KvPolicyConf off2{}; off2.keep_warm_adaptive = true;
         check(kv_keep_target(0, 0, 0, off2) == KvKeep::Nothing, "on with a zero floor is pressure at zero free");
+    }
+
+    // S3-M2: admission negotiation (payer order, band floors, the funded stop).
+    {
+        KvPolicyConf a{}; a.idle_seconds = 30; a.keep_warm_adaptive = true; a.adaptive_low_mib = 1024;
+        KvPolicyConf z{}; z.idle_seconds = 30; z.keep_warm_adaptive = true; z.adaptive_low_mib = 0;
+        using basalt::core::KvKeep;
+        const uint64_t MiB = 1ull << 20, CB = 64 * 1024;
+        std::vector<KvNegLane> one{{7, 400 * MiB, 600 * MiB, CB}};
+        uint64_t est = 42;
+        check(kv_negotiate_keeps(20ull << 30, 1ull << 30, 2ull << 30, one, a, est).empty() && est == 0,
+              "M2: a funded wake has no payers and says nothing");
+        auto p = kv_negotiate_keeps(2 * MiB, 1ull << 30, 300 * MiB, one, a, est);
+        check(p.size() == 1 && p[0].id == 7 && p[0].keep_cells == 0 && p[0].band == KvKeep::Nothing
+                  && est == 600 * MiB, "M2: pressure payer hands everything (keep 0, band answers)");
+        auto pw = kv_negotiate_keeps(2 * MiB, 1ull << 30, 300 * MiB, one, off, est);
+        check(pw.size() == 1 && pw[0].keep_cells == 8192 && est == 200 * MiB,
+              "M2: rail off still negotiates, never below the window");
+        std::vector<KvNegLane> tidy{{3, 100 * MiB, 100 * MiB, CB}};   // backed == its window: pays nothing
+        check(kv_negotiate_keeps(2 * MiB, 1ull << 30, 300 * MiB, tidy, off, est).empty(),
+              "M2: a payer with no spare bytes past its window is never listed");
+        std::vector<KvNegLane> pair{{3, 1ull << 30, 2ull << 30, CB}, {7, 8ull << 30, 8ull << 30, CB}};
+        auto pa = kv_negotiate_keeps(0, 1ull << 30, 5ull << 30, pair, z, est);
+        check(pa.size() == 1 && pa[0].id == 7, "M2: biggest payer first, stop as soon as funded");
+        auto pb = kv_negotiate_keeps(0, 1ull << 30, 9ull << 30, pair, z, est);
+        check(pb.size() == 2 && pb[0].id == 7 && pb[1].id == 3 && pb[1].keep_cells == -1
+                  && pb[1].band == KvKeep::LiveOnly,
+              "M2: the second payer re-prices to ROOM mid-plan (its live span is the room price) and pays its dead slab");
+        std::vector<KvNegLane> slab{{5, 10ull * MiB, 6ull << 30, CB}};   // live 10 MiB under 6 GiB backed
+        auto pr = kv_negotiate_keeps(2ull << 30, 0, 10ull << 30, slab, z, est);
+        check(pr.size() == 1 && pr[0].keep_cells == -1 && pr[0].band == KvKeep::LiveOnly,
+              "M2: a room-band payer keeps the live span, the dead slab pays");
     }
 
     if (fails == 0) { std::printf("kv_policy_test: PASS\n"); return 0; }

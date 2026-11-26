@@ -57,6 +57,7 @@ struct CommonOptions {
     int64_t kv_keep_warm_cells = 8192;    // --kv-keep-warm-cells: newest cells that stay device-backed through a retire
     bool kv_keep_warm_adaptive = false;   // --kv-keep-warm-adaptive: band the keep target on measured pressure (S3-M1)
     int64_t kv_adaptive_low_mib = 1024;   // --kv-adaptive-low-mib: below reserve + this, a retire keeps nothing (S3-M1)
+    bool kv_admit_negotiate = false;      // --kv-admit-negotiate: idle lanes fund a waking lane's declared growth (S3-M2)
     int diag_rows = 0;
     /// --diag-gpu-cut N: diagnostic, a two-card split's second card from layer N on, whatever the shares give (0: off)
     int diag_gpu_cut = 0;

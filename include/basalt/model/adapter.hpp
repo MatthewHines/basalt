@@ -111,6 +111,7 @@ struct LoadRequest {
     int64_t kv_keep_warm_cells = 8192;   ///< --kv-keep-warm-cells: newest cells kept device-backed through a retire (S2)
     bool kv_keep_warm_adaptive = false;  ///< --kv-keep-warm-adaptive: band the keep target on measured pressure (S3-M1)
     int64_t kv_adaptive_low_mib = 1024;  ///< --kv-adaptive-low-mib: below reserve + this, a retire keeps nothing (S3-M1)
+    bool kv_admit_negotiate = false;     ///< --kv-admit-negotiate: idle lanes fund a waking lane's declared growth before the expert cache does (S3-M2)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
 };
 
@@ -171,6 +172,10 @@ public:
     /// S3-M1: measured FREE device bytes (the rail keeps CUDA out of the serve loop by asking the model,
     /// which owns the device). False: cannot measure — the caller falls back to the configured window.
     virtual bool kv_card_free(uint64_t& free_bytes) { (void) free_bytes; return false; }
+    /// S3-M2: KV bytes per cell across the lane's full-visit caches (0: not reportable — negotiation skips).
+    virtual uint64_t kv_cell_bytes() const { return 0; }
+    /// S3-M2: device-backed bytes of the lane's elastic caches (0: nothing held — nothing to hand over).
+    virtual uint64_t kv_backed_bytes() const { return 0; }
     /// The windows reqs[0..n) of the distinct sessions[0..n) (sessions of one model, this one among them) as one batch, the
     /// model's weights read once: each session ends as after its own decode_window(reqs[i]). The windows' rows total at most
     /// batch_rows().

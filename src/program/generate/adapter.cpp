@@ -409,6 +409,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.kv_keep_warm_cells = o.kv_keep_warm_cells;
         lreq.kv_keep_warm_adaptive = o.kv_keep_warm_adaptive;
         lreq.kv_adaptive_low_mib = o.kv_adaptive_low_mib;
+        lreq.kv_admit_negotiate = o.kv_admit_negotiate;
         lreq.diag_rows = o.diag_rows;
         const basalt::model::Result r = adapter->start(lreq, started);
         if (!r.ok() || started.sessions.empty()) return fatal_start_error(r.message);

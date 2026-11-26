@@ -1,4 +1,6 @@
 #include "basalt/core/kv_policy.hpp"
+#include <algorithm>
+#include <vector>
 
 namespace basalt::core {
 namespace {
@@ -39,6 +41,52 @@ KvKeep kv_keep_target(uint64_t free_bytes, uint64_t reserve_bytes, uint64_t live
     if (free_bytes < low) return KvKeep::Nothing;
     if (free_bytes >= low + live_bytes) return KvKeep::LiveOnly;   // live 0 + room: keep nothing, dead slab goes
     return KvKeep::Window;
+}
+
+// The device bytes a keep target leaves on the card: Nothing keeps nothing (the empty window at
+// live: kv_retire(0) retires the head down to live and the slab above); Window keeps min(keep,
+// live) (the window ends at max(live, keep) and starts at live - keep); LiveOnly keeps live.
+namespace {
+uint64_t keep_window_bytes(KvKeep band, int64_t keep_cells, const KvNegLane& lane) {
+    if (band == KvKeep::Nothing) return 0;
+    const uint64_t want = band == KvKeep::LiveOnly
+                              ? lane.live_bytes
+                              : std::min(lane.live_bytes, (uint64_t) keep_cells * lane.cell_bytes);
+    return std::min(want, lane.backed_bytes);   // cannot keep what was never backed
+}
+}  // namespace
+
+std::vector<KvNegKeep> kv_negotiate_keeps(uint64_t free_bytes, uint64_t reserve_bytes,
+                                          uint64_t demand_bytes,
+                                          const std::vector<KvNegLane>& lanes,
+                                          const KvPolicyConf& conf, uint64_t& freed_estimate) {
+    freed_estimate = 0;
+    std::vector<KvNegKeep> plan;
+    const uint64_t low = reserve_bytes + (conf.adaptive_low_mib << 20);
+    if (demand_bytes + low <= free_bytes) return plan;   // the card funds the wake unaided
+    // Order by what each lane could free at the ARRIVAL pressure (descending): the plan takes the
+    // biggest payer first, so one wake costs the fewest retire operations for the same bytes.
+    std::vector<KvNegLane> ordered = lanes;
+    std::sort(ordered.begin(), ordered.end(), [&](const KvNegLane& a, const KvNegLane& b) {
+        const auto price = [&](const KvNegLane& x) {
+            const int64_t k = conf.keep_warm_cells > INT64_MAX ? INT64_MAX : (int64_t) conf.keep_warm_cells;
+            return x.backed_bytes - keep_window_bytes(kv_keep_target(free_bytes, reserve_bytes, x.live_bytes, conf), k, x);
+        };
+        return price(a) > price(b);
+    });
+    uint64_t free_now = free_bytes;
+    const int64_t keep_cfg = conf.keep_warm_cells > INT64_MAX ? INT64_MAX : (int64_t) conf.keep_warm_cells;
+    for (const KvNegLane& lane : ordered) {
+        if (free_now >= demand_bytes + low) break;   // funded
+        const KvKeep band = kv_keep_target(free_now, reserve_bytes, lane.live_bytes, conf);
+        const int64_t keep_cells = band == KvKeep::Nothing ? 0 : band == KvKeep::LiveOnly ? -1 : keep_cfg;
+        const uint64_t win = keep_window_bytes(band, keep_cells, lane);
+        if (lane.backed_bytes <= win) continue;      // pays nothing at this band: skip (never list)
+        plan.push_back({lane.id, keep_cells, band});
+        freed_estimate += lane.backed_bytes - win;
+        free_now += lane.backed_bytes - win;         // the estimate; the moves measure the truth
+    }
+    return plan;
 }
 
 }  // namespace basalt::core

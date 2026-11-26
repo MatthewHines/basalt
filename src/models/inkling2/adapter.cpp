@@ -76,6 +76,10 @@ public:
             o.kv_adaptive_low_mib = std::atoll(args.next("--kv-adaptive-low-mib"));
             return true;
         }
+        if (a == "--kv-admit-negotiate") {   // S3-M2: idle lanes fund a waking lane's declared growth (switch)
+            o.kv_admit_negotiate = true;
+            return true;
+        }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK
     }
 
