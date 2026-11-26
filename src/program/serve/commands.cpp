@@ -261,11 +261,12 @@ void Runtime::retire_idle_lanes() {
             continue;
         }
         basalt::core::kv_policy_note_retired(now_s, kv_pol[i]);
-        if (freed > 0)
-            basalt::log::info("basalt serve", "kv retire: lane %zu handed %.2f GiB of cache to host backing "
-                              "(band %s, %lld warm cells kept, %.2f GiB free at decide)",
-                              i, (double) freed / (double) (1ull << 30), band, (long long) keep,
-                              (double) free_at_decide / (double) (1ull << 30));
+        // The decision line logs even at freed 0: a room band that skipped a retire and a window band that
+        // found nothing past its keep are facts worth seeing once per idle cycle (the retired mark gates it).
+        basalt::log::info("basalt serve", "kv retire: lane %zu settled band %s (%lld warm cells kept, %.2f GiB moved, "
+                          "%.2f GiB free at decide)",
+                          i, band, (long long) keep, (double) freed / (double) (1ull << 30),
+                          (double) free_at_decide / (double) (1ull << 30));
     }
 }
 
