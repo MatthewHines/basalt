@@ -70,8 +70,7 @@ void Runtime::take_prompt_ids(const std::string& cmd) {
 void Runtime::prompt_command(const std::string& cmd) {
     const uint64_t handle = std::strtoull(cmd.c_str() + 6, nullptr, 10);
     if (cmd.rfind("PFREE ", 0) == 0) {
-        std::lock_guard<std::mutex> lk(gent_mu);
-        prompts.erase(handle);
+        prompt_closed(handle);   // S3-M3: the close edge (erase + donation law inside)
         return;
     }
     HeldPrompt p;

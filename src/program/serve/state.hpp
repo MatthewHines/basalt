@@ -229,7 +229,8 @@ public:
     // <n>` at once, even while a request runs; `PMATCH <handle>` then says what each idle slot holds of it.  Guarded by gent_mu.
     struct HeldPrompt {
         std::vector<int32_t> ids;
-        bool media = false;   ///< its pictures are placed by the request that reads it: a held conversation meets it only as an exact prefix
+        bool media = false;   // media ids live in a disjoint namespace; they match nothing (PMATCH's rule)
+        uint16_t owner = 0;   // S3-M3: the slot that last carried this prompt (kv_negotiate_arrival stamps it)
     };
     std::map<uint64_t, HeldPrompt> prompts{};
     static constexpr size_t kPromptsMax = 64;
@@ -370,7 +371,10 @@ public:
     void retire_idle_lanes();                        // every lane whose quiet period passed hands its cache to host backing
     void kv_note_activity(const std::string& line);  // an arriving generation line wakes the lane it names (R5 edge)
     void kv_negotiate_arrival(int slot, uint64_t max_new, const std::string& rest);   // S3-M2: idle lanes fund the waking lane's declared growth (arrival, before the valve)
-    void kv_stamp_idle(size_t lane);                 // the lane's run ended, now
+    void kv_stamp_idle(size_t lane);
+    /// S3-M3: a PFREE closes a conversation - release its host cache and donate the lane's
+    /// device side at once (a closed conversation cannot re-wake; no warm window is kept).
+    void prompt_closed(uint64_t handle);                 // the lane's run ended, now
     bool try_next_line(std::string& out);
 };
 

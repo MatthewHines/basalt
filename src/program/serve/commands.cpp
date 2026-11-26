@@ -294,6 +294,53 @@ void Runtime::kv_stamp_idle(size_t lane) {
     kv_idle_at[lane] = Clock::now();
 }
 
+// S3-M3 close-donation. serve's real close edge is the turn's finally line: the engine wrapper PFREEs the
+// request's held prompt when the turn ends (process.py). It is NOT a farewell - a multi-turn conversation
+// looks exactly like this between its turns - so a close must NOT shred the keep window; the idle_demote
+// grace is the design's answer to "gone or just waiting?". What a close CAN do, instantly and lawfully, is
+// release the host cache (the erase below - already today's behavior) and, IF the card is in the pressure
+// band (someone is hungry NOW), yield the lane's device side at once instead of holding the window for the
+// tick's clock to reach. Band from M1's own pricer: pressure donates; window/room keep. A close never
+// evicts a live span: a lane still decoding (the common case - its turn closed mid-round, others run on)
+// is left to the round's close and the tick. Solo/last-finisher closes are the ones that land here idle,
+// and those are exactly the batch's final yield moments. Policy off = PFREE erases and nothing else.
+void Runtime::prompt_closed(uint64_t handle) {
+    size_t cells = 0, lane = 0;
+    {
+        const std::lock_guard<std::mutex> lk(gent_mu);
+        const auto it = prompts.find(handle);
+        if (it == prompts.end()) return;   // already gone (evicted or freed): no event, no line
+        cells = it->second.ids.size();
+        lane = it->second.owner;
+        prompts.erase(it);   // the host cache - the memory transfer S2 measured - releases at once
+    }
+    if (o.kv_idle_demote_seconds <= 0 || lane >= kv_idle_at.size()) return;   // off = exactly the old erase
+    if (batch_on() && lane < bs.size() && bs[lane].active) return;   // mid-round close: the round and the tick govern
+    auto& s = slot_session((int) lane);
+    const basalt::core::KvPolicyConf conf = kv_conf(o);
+    uint64_t free_bytes = 0;
+    if (!conf.keep_warm_adaptive || !s.kv_card_free(free_bytes)) return;   // unmeasured rail: the tick governs
+    const auto target = basalt::core::kv_keep_target(
+        free_bytes, (uint64_t) std::max<int64_t>(o.vram_reserve_mib, 0) << 20, s.kv_live_bytes(), conf);
+    if (target != basalt::core::KvKeep::Nothing) return;   // window or room: the keep law holds, by design
+    uint64_t freed = 0;
+    std::string err;
+    if (!s.kv_retire(0, freed, err)) {
+        basalt::log::info("basalt serve", "kv donate: lane %zu closed under pressure; the next tick retries (%s)",
+                          lane, err.c_str());
+        return;
+    }
+    if (lane < kv_pol.size()) basalt::core::kv_policy_note_retired(kv_secs(Clock::now()), kv_pol[lane]);
+    if (freed == 0) return;   // the ledger's own doctrine: a pressured close that moves nothing says nothing
+                              // (the resident shape's truth is exactly this line's silence; proof windows saw it speak once)
+    uint64_t free_now = 0;
+    s.kv_card_free(free_now);
+    basalt::log::info("basalt serve",
+                      "kv donate: lane %zu closed under pressure (%zu cells, %.2f GiB yielded, %.2f GiB free now)",
+                      lane, cells, (double) freed / (double) (1ull << 30),
+                      (double) free_now / (double) (1ull << 30));
+}
+
 // ---- S3-M2: admission negotiation. A waking slot declares its size (BGEN/SGEN lines carry max_new and the
 // prompt). If the card cannot fund that growth above the LOW floor, the IDLE lanes hand over warm bytes NOW,
 // each to its M1 band target and never below what the tick itself would keep. The order is the point: idle
@@ -335,7 +382,10 @@ void Runtime::kv_negotiate_arrival(int slot, uint64_t max_new, const std::string
             if (toks[t][0] == '#') named = &toks[t];
         if (named != nullptr) {
             const auto it = prompts.find(std::strtoull(named->c_str() + 1, nullptr, 10));
-            if (it != prompts.end()) { ids = it->second.ids; media = it->second.media; prompt_len = ids.size(); }
+            if (it != prompts.end()) {
+                ids = it->second.ids; media = it->second.media; prompt_len = ids.size();
+                it->second.owner = (uint16_t) slot;   // S3-M3: close-donation follows the conversation home
+            }
         }
         if (ids.empty()) {   // text form "GEN <mn> <nbytes> <text...>": the text's bytes bound the need
             size_t spaces = 0, seen = 0;
