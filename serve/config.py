@@ -56,7 +56,10 @@ def rails_clock_spoken(args: list[str]) -> bool:
     """True when the argv speaks `--kv-idle-demote-seconds` > 0: the substrate every shared rail rides (the
     retire tick, the close donation and the arrival negotiation all return at `idle_demote == 0`). With no
     clock the words are not a posture but a boot error (adaptive) or a silence (negotiate): the clock decides
-    whether the rails ride, and an argv without one keeps the engine's old behavior byte-identical."""
+    whether the rails ride, and an argv without one keeps the engine's old behavior byte-identical.
+    Only the separate-word form is read — the argv builder emits separate words (engine_words; extras
+    split on '='), so the equals form never occurs here; if a caller hand-speaks one, it reads as no
+    clock (named honestly at server start: "speaks no usable one") rather than a silent parse."""
     v = flag_value(args, "--kv-idle-demote-seconds")
     try:
         return v is not None and float(v) > 0

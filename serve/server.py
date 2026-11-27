@@ -257,7 +257,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         rwords, rails_skipped = kv_rails_words(known, engine_args(cfg), (lambda flag: flag_refused(a.engine_bin, a.model, [flag]))
                                                                      if a.model and a.engine_bin else None)
         for flag in rails_skipped:   # the clock law fires before the probe, so name the reason that stopped it
-            why = ("the rail rides --kv-idle-demote-seconds > 0 and this argv speaks none"
+            why = ("the rail rides --kv-idle-demote-seconds > 0 and this argv speaks no usable one"
                    if not rails_clock_spoken(engine_args(cfg)) else "this model has no such flag")
             cfg["start_lines"].append(tagged("engine", f"{flag[2:]} (the rails): {why}, skipped"))
         sampling_defaults = {**sampling_defaults_from_config(cfg), **a.sampling_launch}

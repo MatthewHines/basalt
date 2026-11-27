@@ -29,8 +29,26 @@ class RailsClock(unittest.TestCase):
         self.assertFalse(rails_clock_spoken([]))
         self.assertFalse(rails_clock_spoken(["--kv-idle-demote-seconds", "0"]))
         self.assertFalse(rails_clock_spoken(["--kv-idle-demote-seconds", "abc"]))
+        self.assertFalse(rails_clock_spoken(["--kv-idle-demote-seconds", "-5"]))
+        self.assertFalse(rails_clock_spoken(["--model", "x", "--kv-idle-demote-seconds"]))  # trailing, valueless
         self.assertTrue(rails_clock_spoken(CLOCK))
         self.assertTrue(rails_clock_spoken(["--kv-idle-demote-seconds", "1"]))
+        self.assertTrue(rails_clock_spoken(["--kv-idle-demote-seconds", "1e3"]))
+        # the engine's law is last-flag-wins, and flag_value reads the LAST occurrence
+        self.assertTrue(rails_clock_spoken(["--kv-idle-demote-seconds", "0", "--kv-idle-demote-seconds", "30"]))
+        self.assertFalse(rails_clock_spoken([*CLOCK, "--kv-idle-demote-seconds", "0"]))
+        # the equals form is documented not to parse (the argv builder emits separate words): reads as no clock
+        self.assertFalse(rails_clock_spoken(["--kv-idle-demote-seconds=30"]))
+
+    def test_no_probe_ever_runs_without_the_clock(self):
+        # the comment's claim, pinned: the clock gate comes first, so a refused-probe that WOULD refuse is
+        # never even called — a probe-order regression must fail this, not pass silently
+        calls = []
+        def refused(flag):
+            calls.append(flag)
+            return False
+        self.assertEqual(kv_rails_words(RAILS, [], refused=refused), ([], ["--kv-keep-warm-adaptive", "--kv-admit-negotiate"]))
+        self.assertEqual(calls, [])
 
     def test_no_clock_means_no_rails_words_and_both_are_named(self):
         # even a model that accepts every rail gets nothing: the substrate comes first (and no probe runs)
