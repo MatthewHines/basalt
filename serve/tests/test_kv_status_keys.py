@@ -14,24 +14,66 @@ from pathlib import Path
 from unittest import mock
 
 from serve.engine.process import ProcessEngine
-from serve.config import kv_rails_words
+from serve.config import kv_rails_words, rails_clock_spoken
 from serve.service import kv_view
 
 RAILS = {"--kv-keep-warm-adaptive", "--kv-admit-negotiate", "--no-kv-keep-warm-adaptive", "--no-kv-admit-negotiate"}
+CLOCK = ["--kv-idle-demote-seconds", "30"]   # the substrate every rail rides (shared serve gates on idle > 0)
+
+
+class RailsClock(unittest.TestCase):
+    """The clock law (Q0): a rails word without its substrate is a boot error (adaptive) or a silence
+    (negotiate) — so the argv's `--kv-idle-demote-seconds` decides whether the words ride at all."""
+
+    def test_the_clock_helper(self):
+        self.assertFalse(rails_clock_spoken([]))
+        self.assertFalse(rails_clock_spoken(["--kv-idle-demote-seconds", "0"]))
+        self.assertFalse(rails_clock_spoken(["--kv-idle-demote-seconds", "abc"]))
+        self.assertTrue(rails_clock_spoken(CLOCK))
+        self.assertTrue(rails_clock_spoken(["--kv-idle-demote-seconds", "1"]))
+
+    def test_no_clock_means_no_rails_words_and_both_are_named(self):
+        # even a model that accepts every rail gets nothing: the substrate comes first (and no probe runs)
+        words, skipped = kv_rails_words(RAILS, [], refused=lambda flag: False)
+        self.assertEqual(words, [])
+        self.assertEqual(skipped, ["--kv-keep-warm-adaptive", "--kv-admit-negotiate"])
+        # a spoken clock restores the posture
+        self.assertEqual(kv_rails_words(RAILS, CLOCK, refused=lambda flag: False),
+                         (["--kv-keep-warm-adaptive", "--kv-admit-negotiate"], []))
 
 
 class RailsDefault(unittest.TestCase):
-    """M4's posture: the rails ride by default on any engine that has the flags, exactly as grammar words
-    default on — and the negation form is the explicit off, honored over the default."""
+    """M4's posture: the rails ride by default on any engine that has the flags and has been given its
+    clock, exactly as grammar words default on — and the negation form is the explicit off, honored over
+    the default."""
 
-    def test_advertised_rails_ride_unless_argv_already_speaks_them(self):
-        self.assertEqual(kv_rails_words(RAILS, []), ["--kv-keep-warm-adaptive", "--kv-admit-negotiate"])
-        self.assertEqual(kv_rails_words(RAILS, ["--kv-keep-warm-adaptive"]), ["--kv-admit-negotiate"])
-        self.assertEqual(kv_rails_words(RAILS, ["--no-kv-admit-negotiate"]), ["--kv-keep-warm-adaptive"])
+    def test_advertised_rails_ride_with_their_clock(self):
+        self.assertEqual(kv_rails_words(RAILS, CLOCK), (["--kv-keep-warm-adaptive", "--kv-admit-negotiate"], []))
+        self.assertEqual(kv_rails_words(RAILS, [*CLOCK, "--kv-keep-warm-adaptive"]), (["--kv-admit-negotiate"], []))
+        self.assertEqual(kv_rails_words(RAILS, [*CLOCK, "--no-kv-admit-negotiate"]), (["--kv-keep-warm-adaptive"], []))
 
     def test_an_engine_without_the_flags_starts_byte_identical(self):
-        self.assertEqual(kv_rails_words({"--grammar", "--model"}, ["--model", "x"]), [])
-        self.assertEqual(kv_rails_words(None, []), [])      # blind probe: add nothing, guess nothing
+        self.assertEqual(kv_rails_words({"--grammar", "--model"}, ["--model", "x"]), ([], []))
+        self.assertEqual(kv_rails_words(None, []), ([], []))      # blind probe: add nothing, guess nothing
+
+    def test_a_model_that_refuses_a_rail_is_skipped_and_named(self):
+        # the binary can advertise the rails while this model's adapter refuses them (qwen4exp, which has no
+        # keep-warm rails): the rail is dropped and named, never appended — the engine is told the truth
+        refused = {"--kv-keep-warm-adaptive"}
+        words, skipped = kv_rails_words(RAILS, CLOCK, refused=lambda flag: flag in refused)
+        self.assertEqual(words, ["--kv-admit-negotiate"])
+        self.assertEqual(skipped, ["--kv-keep-warm-adaptive"])
+        # a model that wants only one of its rails still gets the other
+        words, skipped = kv_rails_words(RAILS, CLOCK, refused=lambda flag: True)
+        self.assertEqual(words, [])
+        self.assertEqual(skipped, ["--kv-keep-warm-adaptive", "--kv-admit-negotiate"])
+        # an explicit off is an intent, not a refusal: the negated rail is neither added nor named as skipped
+        words, skipped = kv_rails_words(RAILS, [*CLOCK, "--no-kv-admit-negotiate"], refused=lambda flag: False)
+        self.assertEqual(words, ["--kv-keep-warm-adaptive"])
+        self.assertEqual(skipped, [])
+        words, skipped = kv_rails_words(RAILS, [*CLOCK, "--no-kv-keep-warm-adaptive"], refused=lambda flag: True)
+        self.assertEqual(words, [])
+        self.assertEqual(skipped, ["--kv-admit-negotiate"])
 
 FAKE = r'''
 import sys

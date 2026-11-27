@@ -24,8 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags,  # noqa: E402
-                          engine_flags_of, grammar_words, kv_rails_words, model_line, model_settings, sampling_defaults_from_config,
-                          sampling_items, shared_line, slot_share, slots_text, start_items, with_spec)
+                          engine_flags_of, grammar_words, kv_rails_words, model_line, model_settings, rails_clock_spoken,
+                          sampling_defaults_from_config, sampling_items, shared_line, slot_share, slots_text, start_items,
+                          with_spec)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.image_source import image_sources_of  # noqa: E402
@@ -253,6 +254,12 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     if not a.mock_engine:
         vision = None
         env = child_env(cfg)
+        rwords, rails_skipped = kv_rails_words(known, engine_args(cfg), (lambda flag: flag_refused(a.engine_bin, a.model, [flag]))
+                                                                     if a.model and a.engine_bin else None)
+        for flag in rails_skipped:   # the clock law fires before the probe, so name the reason that stopped it
+            why = ("the rail rides --kv-idle-demote-seconds > 0 and this argv speaks none"
+                   if not rails_clock_spoken(engine_args(cfg)) else "this model has no such flag")
+            cfg["start_lines"].append(tagged("engine", f"{flag[2:]} (the rails): {why}, skipped"))
         sampling_defaults = {**sampling_defaults_from_config(cfg), **a.sampling_launch}
         if a.lazy and not multi:
             drop_sidecar_vision(cfg)
@@ -274,7 +281,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         if a.grammar and not has_grammar:
             print(tagged("warning", "grammar is on but this engine has no --grammar; requests go without one"), flush=True)
         gwords = grammar_words(known)
-        rwords = kv_rails_words(known, engine_args(cfg))   # the rails' default-on posture (S3-M4)
+        # the rails ride together with gwords: the default-on posture (S3-M4), filtered per model above
         cdir = flag_value(engine_args(cfg), "--conversation-cache-dir")
         cmib = flag_value(engine_args(cfg), "--conversation-cache-disk-mib") or "0"
         if cdir and cmib != "0" and a.debug:

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from serve import ROOT
-from serve.engine.flags import flag_index
+from serve.engine.flags import flag_index, flag_value
 from serve.engine.image_source import parse_url_host
 from serve.engine.vision import VIDEO_MAX_TOKENS, VISION_MODES, VISION_USAGE, vision_mode
 from serve.util.console import tagged
@@ -52,14 +52,40 @@ def grammar_words(known: set[str] | None) -> list[str]:
     return ["--grammar", "on"] if known is not None and "--grammar" in known else []
 
 
-def kv_rails_words(known: set[str] | None, args: list[str]) -> list[str]:
-    """The keep-warm rails' words (S3-M4): each switch the engine binary has and the model's argv does not already
-    speak — neither the plain form (already on) nor the `--no-` form (an explicit off). The rails are the intended
-    posture (the S3 program's endstate), and an engine without the flags starts byte-identical, as with grammar."""
+def rails_clock_spoken(args: list[str]) -> bool:
+    """True when the argv speaks `--kv-idle-demote-seconds` > 0: the substrate every shared rail rides (the
+    retire tick, the close donation and the arrival negotiation all return at `idle_demote == 0`). With no
+    clock the words are not a posture but a boot error (adaptive) or a silence (negotiate): the clock decides
+    whether the rails ride, and an argv without one keeps the engine's old behavior byte-identical."""
+    v = flag_value(args, "--kv-idle-demote-seconds")
+    try:
+        return v is not None and float(v) > 0
+    except ValueError:
+        return False
+
+
+def kv_rails_words(known: set[str] | None, args: list[str], refused=None):
+    """The keep-warm rails' words (S3-M4): each switch the engine binary has, the model's argv does not already
+    speak — neither the plain form (already on) nor the `--no-` form (an explicit off) — that the model accepts
+    (when `refused` is given, the `--gpu-plan` probe: the model in the file has no such flag) and that the argv
+    has given its substrate clock (`rails_clock_spoken`: no clock, no rail). The rails are the intended posture
+    (the S3 program's endstate), and an engine without the flags starts byte-identical, as with grammar.
+    Returns (words, skipped): the rails to add and the ones that cannot ride — a skipped word is named."""
     if known is None:
-        return []
-    return [flag for flag in ("--kv-keep-warm-adaptive", "--kv-admit-negotiate")
-            if flag in known and flag not in args and "--no-" + flag[2:] not in args]
+        return [], []
+    words, skipped = [], []
+    clock = rails_clock_spoken(args)
+    for flag in ("--kv-keep-warm-adaptive", "--kv-admit-negotiate"):
+        if flag not in known or flag in args or "--no-" + flag[2:] in args:
+            continue
+        if not clock:               # the substrate law first: it makes the per-model probe moot (and its cost)
+            skipped.append(flag)
+            continue
+        if refused is not None and refused(flag):
+            skipped.append(flag)
+            continue
+        words.append(flag)
+    return words, skipped
 
 
 def split_engine_extras(extras: list[str]) -> list[str]:
