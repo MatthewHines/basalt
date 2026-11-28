@@ -6,6 +6,7 @@ import math
 import os
 import select
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -20,7 +21,10 @@ from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
 from serve.api.documents import sources as document_sources
+from serve.ecm import home as ecm_home
 from serve.ecm import ping as ecm_ping
+from serve.ecm import heal as ecm_heal
+from serve.ecm import client as ecm_client
 from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
@@ -471,11 +475,13 @@ def make_handler(target: Service | Router):
                 # operator health (PING-CONTRACT): no auth, like /health - loopback-facing
                 # and read-only; attribution rides every reply via send_response.
                 shown = router.shown()
-                code, body = ecm_ping.build(shown.model, shown.v1_status)
+                code, body = ecm_ping.build(shown.model, shown.v1_status,
+                                            log_path=ecm_home.decision_log_path())
                 self._json(code, body)
             elif path == "/v1/ecm":
                 shown = router.shown()
-                self._json(200, ecm_ping.table(shown.model, shown.v1_status))
+                self._json(200, ecm_ping.table(shown.model, shown.v1_status,
+                                               log_path=ecm_home.decision_log_path()))
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -604,6 +610,67 @@ def make_handler(target: Service | Router):
                         self._json(200, router.live.answer_now(rid, None if rid else self._session_id(req)))
                     except AnswerNowRefused as e:
                         self._json(e.status, e.body())
+                    return
+                if path == "/v1/ecm/heal":
+                    # ONE heal policy (ECM-W2-DESIGN §4): the pure decision lives in
+                    # serve/ecm/heal.py; here only plumbing - driver truth, self-verbs over
+                    # the client seam (the 415 law binds the ECM to ITSELF), and the
+                    # window guard read from its mounted side. 202 = queued, like /v1/vram:
+                    # the ledger entries (heal.required -> heal.replanned) are the truth.
+                    shown = router.shown()
+                    base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+                    def _unload() -> None:
+                        ecm_client.post_json(f"{base}/v1/unload", timeout=30)
+
+                    def _load() -> None:
+                        ecm_client.post_json(f"{base}/v1/load", timeout=180)
+
+                    def _wait_loaded() -> None:
+                        deadline = time.time() + 300
+                        while time.time() < deadline:
+                            st = ecm_client.get_json(f"{base}/v1/status", timeout=5)
+                            if isinstance(st, dict) and st.get("loaded"):
+                                return
+                            time.sleep(3)
+                        raise TimeoutError("primary did not reach loaded within 300 s")
+
+                    def _driver_free() -> int | None:
+                        gpu = str(int(getattr(shown, "gpu_index", 0) or 0))
+                        run = subprocess.run(
+                            ["nvidia-smi", "-i", gpu, "--query-gpu=memory.free",
+                             "--format=csv,noheader,nounits"],
+                            capture_output=True, text=True, timeout=8)
+                        if run.returncode != 0:
+                            return None
+                        return int(float(run.stdout.strip().splitlines()[0]))
+
+                    def _window_guard() -> str | None:
+                        root = "/out/window/inkling"  # the bind's container side; the open predicate is swarm-ctl's C5/D4 law
+                        try:
+                            names = sorted(os.listdir(root))
+                        except OSError as exc:
+                            return f"window state unreadable at {root} ({exc}) - refusing to heal blind"
+                        for name in names:
+                            sj = os.path.join(root, name, "state.json")
+                            if not os.path.isfile(sj):
+                                continue
+                            try:
+                                with open(sj, encoding="utf-8") as fh:
+                                    d = json.load(fh)
+                            except (OSError, ValueError):
+                                return f"window {name}: state.json unreadable - refusing to heal over a window we cannot rule"
+                            if d.get("returned", "0") == "0" and d.get("abandoned", "0") != "1":
+                                return f"a window is OPEN ({name}) - re-plan AFTER hand-back"
+                        return None
+
+                    entry = ecm_heal.replan(
+                        status_reader=shown.v1_status, free_reader=_driver_free,
+                        unload=_unload, load=_load, wait_loaded=_wait_loaded,
+                        log_path=ecm_home.decision_log_path(), guards=(_window_guard,),
+                        spawn=lambda work: threading.Thread(target=work, daemon=True).start())
+                    self._json(202 if entry.get("event") == "heal.required" else 200,
+                               {"decision": entry})
                     return
                 if path == "/v1/vram":                       # resize the VRAM reserve
                     if not self._own_page("the VRAM reserve can be changed"):

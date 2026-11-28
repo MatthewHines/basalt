@@ -24,7 +24,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
-from .. import client, decision_log, ping
+from .. import client, decision_log, heal, home, ping
 from ..calibration import CALIBRATION_V1, demand_fits
 from .fake_engine import FakeEngine, RefusingEngine, WorkingEngine
 
@@ -272,6 +272,124 @@ def ecm_ping_log_view() -> None:
             eng.stop()
 
 
+def heal_quiet_gate() -> None:
+    """Silence must be PROVEN (fail-closed): in-flight, too-recent, or unreadable all
+    answer 'not quiet'; >= QUIET seconds of silence answers quiet."""
+    now = 1_000_000.0
+    cases = [
+        ({"activity": {"in_flight": 2, "last_request_at": now}}, False, "in flight"),
+        ({"activity": {"in_flight": 0, "last_request_at": now - 5}}, False, "silence"),
+        ({"activity": {"in_flight": 0, "last_request_at": now - heal.QUIET_SILENCE_SECONDS - 1}}, True, ""),
+        ({}, False, "fail-closed"),
+    ]
+    for status, want, needle in cases:
+        quiet, why = heal.quiet_check(status, now)
+        assert quiet is want, f"{status} -> {quiet} ({why})"
+        if needle:
+            assert needle in why, why
+
+
+def heal_verdict() -> None:
+    """The predicate is a CEILING on idle free (healthy card runs full; a crowd-made
+    plan leaves headroom): above ceiling -> required, at-or-below -> healthy; no reading
+    is unreadable, never a guess; an unloaded primary has no plan to heal."""
+    assert heal.r1_verdict(True, heal.HEADROOM_CEILING_MIB + 1)[0] == "required"
+    assert heal.r1_verdict(True, heal.HEADROOM_CEILING_MIB)[0] == "healthy"
+    assert heal.r1_verdict(True, 1_904)[0] == "healthy"  # the measured live steady state
+    assert heal.r1_verdict(True, None)[0] == "unreadable"
+    assert heal.r1_verdict(False, 1_000)[0] == "not-applicable"
+
+
+def heal_plan_guards_first() -> None:
+    """Policy beats fact: with a required verdict AND an open window, the answer is the
+    guard's reason, not a replan."""
+    now = 1_000_000.0
+    status = {"loaded": True,
+              "activity": {"in_flight": 0, "last_request_at": now - 400}}
+    action, reason = heal.plan(status=status, free_mib=10_000,
+                               guards=[lambda: "a window is OPEN (w1) - re-plan AFTER hand-back"],
+                               now=now)
+    assert action == "refused" and "OPEN" in reason, (action, reason)
+    action2, _ = heal.plan(status=status, free_mib=10_000, guards=[], now=now)
+    assert action2 == "replan"
+
+
+def heal_replan_flow() -> None:
+    """Required -> exactly one unload/load/wait cycle, logged required->replanned;
+    immediately asking again on a healed card answers already with NO verbs."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "decisions.jsonl")
+        calls: list[str] = []
+        frees = iter([26_000, 2_000])  # crowd-made (headroom unplanned) now, card-full after the cycle
+
+        def status_reader() -> dict:
+            return {"loaded": True, "activity": {"in_flight": 0,
+                                                 "last_request_at": time.time() - 400}}
+        e1 = heal.replan(status_reader=status_reader, free_reader=lambda: next(frees),
+                         unload=lambda: calls.append("unload"),
+                         load=lambda: calls.append("load"),
+                         wait_loaded=lambda: calls.append("wait"),
+                         log_path=path)
+        assert e1["event"] == "heal.required", e1
+        assert calls == ["unload", "load", "wait"], calls
+        e2 = heal.replan(status_reader=status_reader, free_reader=lambda: 2_000,
+                         unload=lambda: calls.append("unload2"),
+                         load=lambda: calls.append("load2"),
+                         wait_loaded=lambda: None, log_path=path)
+        assert e2["event"] == "heal.checked" and e2["decision"] == "already", e2
+        assert calls == ["unload", "load", "wait"], f"second opinion moved verbs: {calls}"
+        events = [e["event"] for e in decision_log.read(path)]
+        assert events == ["heal.required", "heal.replanned", "heal.checked"], events
+
+
+def heal_guard_refuses_without_verbs() -> None:
+    """A guarded refusal touches NOTHING: the fake engine's request log stays POST-free
+    and the ledger carries reason verbatim + remedy."""
+    eng = WorkingEngine()
+    try:
+        eng.status["activity"]["last_request_at"] = time.time() - 400
+        entry = heal.replan(
+            status_reader=_status(eng),
+            free_reader=lambda: 10_000,
+            unload=lambda: eng.seen.append({"method": "BUG"}),
+            load=lambda: eng.seen.append({"method": "BUG"}),
+            wait_loaded=lambda: None,
+            guards=[lambda: "a labeled guest container exists - refusing (hand its window back first)"])
+        assert entry["event"] == "heal.refused" and entry["decision"] == "refuse", entry
+        assert "guest container exists" in entry["reason"]
+        assert entry["operator_hint"], "a refusal without a remedy is noise"
+        assert not [r for r in eng.seen if r["method"] != "GET"], "guarded refusal ran verbs"
+    finally:
+        eng.stop()
+
+
+def heal_unreadable_driver() -> None:
+    """No driver truth = degraded refusal with the nvidia-smi remedy - never a silent
+    pass, never a guess about the card."""
+    entry = heal.replan(status_reader=lambda: {"loaded": True, "activity": {"in_flight": 0,
+                                                                            "last_request_at": 0}},
+                        free_reader=lambda: None,
+                        unload=lambda: None, load=lambda: None, wait_loaded=lambda: None)
+    assert entry["decision"] == "degraded", entry
+    assert "nvidia-smi" in entry["operator_hint"], entry["operator_hint"]
+    assert entry["persisted"] is False, "no-home entries must say so"
+
+
+def home_resolution() -> None:
+    """ECM_STATE_DIR wins; without it, no /out mount (host/bench side) means UNASSIGNED -
+    honestly None, never a guessed writable path."""
+    saved = dict(os.environ)
+    try:
+        os.environ["ECM_STATE_DIR"] = "/tmp/ecm-test-home"
+        assert home.decision_log_path() == "/tmp/ecm-test-home/decisions.jsonl"
+        del os.environ["ECM_STATE_DIR"]
+        if not os.path.isdir("/out/window/inkling"):  # true on the host; container side is the drill's job
+            assert home.decision_log_path() is None
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
 def registry_honest() -> None:
     """Every pending branch names an owning slice, and the runner's own data shows no
     pending branch can report PASS (fn is None iff owner is set)."""
@@ -306,6 +424,13 @@ BRANCHES: list[Branch] = [
     Branch("ecm-ping.starved-ref2", ecm_ping_starved),
     Branch("ecm-ping.speed-budget", ecm_ping_speed),
     Branch("ecm-ping.drill-view", ecm_ping_log_view),
+    Branch("heal.quiet-gate", heal_quiet_gate),
+    Branch("heal.r1-verdict", heal_verdict),
+    Branch("heal.plan-guards-first", heal_plan_guards_first),
+    Branch("heal.replan-flow", heal_replan_flow),
+    Branch("heal.guard-no-verbs", heal_guard_refuses_without_verbs),
+    Branch("heal.unreadable-driver", heal_unreadable_driver),
+    Branch("home.resolution", home_resolution),
     Branch("registry.honest", registry_honest),
     # BENCH-BRANCHES.md minimum list, owned per ECM-W2-DESIGN §7 slicing:
     Branch("B-1.wake-happy-path", None, "W2-4"),
