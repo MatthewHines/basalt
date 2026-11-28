@@ -20,6 +20,7 @@ from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
 from serve.api.documents import sources as document_sources
+from serve.ecm import ping as ecm_ping
 from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
@@ -316,7 +317,7 @@ def make_handler(target: Service | Router):
                 data = b"data: " + json.dumps({"error": err}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
             self.wfile.write(data)
 
-        def _json(self, code, obj):
+        def _json(self, code, obj, extra=()):
             if self.sse_open:
                 return self._stream_error(obj)
             body = json.dumps(obj, ensure_ascii=False).encode()
@@ -327,6 +328,8 @@ def make_handler(target: Service | Router):
                 self.send_header("Retry-After", "30")
             self.send_header("Content-Type", "application/json")
             self._cors()
+            for _name, _value in extra:
+                self.send_header(_name, _value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -454,6 +457,16 @@ def make_handler(target: Service | Router):
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, {**router.shown().v1_status(), "models": router.models(), "swap": router.swap_status()})
+            elif path == "/v1/ecm/ping":
+                # operator health (PING-CONTRACT): no auth, like /health - loopback-facing
+                # and read-only; it answers for the engine that answered, always attributed.
+                shown = router.shown()
+                code, body = ecm_ping.build(shown.model, shown.v1_status)
+                self._json(code, body, extra=(("x-ecm-engine", shown.model),))
+            elif path == "/v1/ecm":
+                shown = router.shown()
+                self._json(200, ecm_ping.table(shown.model, shown.v1_status),
+                           extra=(("x-ecm-engine", shown.model),))
             else:
                 self._json(404, {"error": {"message": "not found"}})
 

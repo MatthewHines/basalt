@@ -18,12 +18,13 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
-from .. import client, decision_log
+from .. import client, decision_log, ping
 from ..calibration import CALIBRATION_V1, demand_fits
 from .fake_engine import FakeEngine, RefusingEngine, WorkingEngine
 
@@ -149,6 +150,128 @@ def calibration_fit_points() -> None:
     assert demand_fits(21_503) is False
 
 
+def _status(eng: FakeEngine):
+    """A primary_status reader that goes over the wire - the ping is tested through the
+    same seam the live route uses, not against an in-process shortcut."""
+    def read() -> dict:
+        out = client.get_json(f"{eng.url}/v1/status")
+        assert isinstance(out, dict), out
+        return out
+    return read
+
+
+def ecm_ping_shape() -> None:
+    """PC-1: healthy primary, no guest -> 200, ok:true, state reaped, full body shape."""
+    eng = WorkingEngine()
+    try:
+        code, body = ping.build("fake-qwen", _status(eng))
+        assert code == 200 and body["ok"] is True, body
+        assert body["engine"] == "fake-qwen"
+        assert body["state"] == "reaped" and body["guest"]["state"] == "reaped", body
+        assert body["primary"]["loaded"] is True, body["primary"]
+        assert body["degraded"] is None
+        assert body["decision_log"]["latest_id"] is None
+    finally:
+        eng.stop()
+
+
+def ecm_ping_readonly() -> None:
+    """PC-2, machine-checked: the fake engine's own request log shows the ping issued
+    GETs only - a POST anywhere is a contract violation, no audit tool needed."""
+    eng = WorkingEngine()
+    try:
+        ping.build("fake-qwen", _status(eng))
+        ping.build("fake-qwen", _status(eng))
+        assert eng.seen, "ping derived nothing live - it read no status at all"
+        posts = [r for r in eng.seen if r["method"] != "GET"]
+        assert not posts, f"ping is not read-only: {posts}"
+    finally:
+        eng.stop()
+
+
+def ecm_ping_no_cache() -> None:
+    """PC-7: two pings, reality flipped between them - the second says the new truth."""
+    eng = WorkingEngine()
+    try:
+        _, b1 = ping.build("fake-qwen", _status(eng))
+        assert b1["primary"]["loaded"] is True
+        eng.status["loaded"] = False
+        _, b2 = ping.build("fake-qwen", _status(eng))
+        assert b2["primary"]["loaded"] is False, "ping served a cached status"
+    finally:
+        eng.stop()
+
+
+def ecm_ping_unreachable() -> None:
+    """REF-4 / PC-5: primary dark -> 503, ok:false, state unknown, full refusal shape.
+    Silence gets the REF-4 words; never ok:true, never an empty body."""
+    eng = WorkingEngine()
+    eng.stop()  # free the port: now nothing answers
+    code, body = ping.build("fake-qwen", _status(eng))
+    assert code == 503 and body["ok"] is False, body
+    assert body["state"] == "unknown"
+    assert ping.REF4_REASON in body["reason"], body["reason"]
+    assert body["lease"] == {"asked_mib": None, "applied_mib": None}
+    assert body["next"].startswith("curl"), body["next"]
+    assert "decision_log" in body
+
+
+def ecm_ping_starved() -> None:
+    """REF-2 class / PC-4: starved guest -> 503 with the reason VERBATIM, the lease tuple
+    from the guest reader, and the decision-log id of the refusal that caused it."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "decisions.jsonl")
+        e = decision_log.append(path, event="guest.wake.refused", decision="refuse",
+                                reason="experts cannot fit",
+                                operator_hint="bash swarm-ctl.sh status")
+        eng = WorkingEngine()
+        try:
+            def guest() -> dict:
+                return {"state": "starved", "name": "inkling", "reason": "experts cannot fit",
+                        "lease_asked_mib": 12800, "lease_applied_mib": 2048}
+            code, body = ping.build("fake-qwen", _status(eng), guest=guest, log_path=path)
+            assert code == 503 and body["ok"] is False
+            assert body["state"] == "starved"
+            assert body["reason"] == "experts cannot fit", body["reason"]  # verbatim
+            assert body["lease"] == {"asked_mib": 12800, "applied_mib": 2048}, body["lease"]
+            assert body["decision_log"]["latest_id"] == e["id"]
+            assert body["next"] == ping.NEXT_FOR["starved"]
+        finally:
+            eng.stop()
+
+
+def ecm_ping_speed() -> None:
+    """The <1 s idle budget (PC-1), averaged over three loopback pings - generous on
+    purpose; this catches an accidental sleep or a retry storm, not jitter."""
+    eng = WorkingEngine()
+    try:
+        t0 = time.perf_counter()
+        for _ in range(3):
+            ping.build("fake-qwen", _status(eng))
+        avg = (time.perf_counter() - t0) / 3
+        assert avg < 1.0, f"{avg:.3f}s average - over the idle budget"
+    finally:
+        eng.stop()
+
+
+def ecm_ping_log_view() -> None:
+    """The drill view: capped, ordered tail of the log; count and latest id agree."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "decisions.jsonl")
+        ids = [decision_log.append(path, event="lease.set", lease={"asked_mib": i})["id"]
+               for i in range(25)]
+        eng = WorkingEngine()
+        try:
+            view = ping.table("fake-qwen", _status(eng), log_path=path, cap=20)
+            assert [e["id"] for e in view["decisions"]] == ids[-20:]
+            assert view["ok"] is True
+            _, body = ping.build("fake-qwen", _status(eng), log_path=path)
+            assert body["decision_log"]["latest_id"] == ids[-1]
+            assert body["decision_log"]["entries_24h"] == 25
+        finally:
+            eng.stop()
+
+
 def registry_honest() -> None:
     """Every pending branch names an owning slice, and the runner's own data shows no
     pending branch can report PASS (fn is None iff owner is set)."""
@@ -176,6 +299,13 @@ BRANCHES: list[Branch] = [
     Branch("log.monotonic", log_monotonic),
     Branch("log.corrupt-raises", log_corrupt_raises),
     Branch("calibration.fit-points", calibration_fit_points),
+    Branch("ecm-ping.shape-pc1", ecm_ping_shape),
+    Branch("ecm-ping.readonly-pc2", ecm_ping_readonly),
+    Branch("ecm-ping.no-cache-pc7", ecm_ping_no_cache),
+    Branch("ecm-ping.unreachable-ref4", ecm_ping_unreachable),
+    Branch("ecm-ping.starved-ref2", ecm_ping_starved),
+    Branch("ecm-ping.speed-budget", ecm_ping_speed),
+    Branch("ecm-ping.drill-view", ecm_ping_log_view),
     Branch("registry.honest", registry_honest),
     # BENCH-BRANCHES.md minimum list, owned per ECM-W2-DESIGN §7 slicing:
     Branch("B-1.wake-happy-path", None, "W2-4"),

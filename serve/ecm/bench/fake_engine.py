@@ -85,7 +85,11 @@ class FakeEngine:
         self.refusal_reason = refusal_reason
         self.enforce_json = enforce_json
         self.seen: list[dict] = []
-        self.status: dict = {"model_loaded": True, "in_flight": 0}
+        # shaped like the real v1_status subset the ping reads, so _primary_view is tested
+        # against the live key names, not against invented ones.
+        self.status: dict = {"loaded": True,
+                             "activity": {"in_flight": 0, "requests": 0},
+                             "vram": {"free_mib": 30_000}}
         self._server = _Server(("127.0.0.1", 0), _Handler)
         self._server.engine = self
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
