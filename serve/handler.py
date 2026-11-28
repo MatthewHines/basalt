@@ -317,7 +317,19 @@ def make_handler(target: Service | Router):
                 data = b"data: " + json.dumps({"error": err}, ensure_ascii=False).encode() + b"\n\ndata: [DONE]\n\n"
             self.wfile.write(data)
 
-        def _json(self, code, obj, extra=()):
+        def send_response(self, code, message=None):
+            """Attribution (PC-9) at the one choke point every response crosses - JSON,
+            errors, and SSE alike (ECM-W2-DESIGN §5 ruling: the primary's own replies are
+            attributed too; the UI never guesses who answered). An engine that cannot be
+            named is answered honestly as 'unknown', never silently unattributed."""
+            super().send_response(code, message)
+            try:
+                name = router.shown().model or "unknown"
+            except Exception:  # noqa: BLE001 - attribution must never break a response
+                name = "unknown"
+            self.send_header("x-ecm-engine", str(name))
+
+        def _json(self, code, obj):
             if self.sse_open:
                 return self._stream_error(obj)
             body = json.dumps(obj, ensure_ascii=False).encode()
@@ -328,8 +340,6 @@ def make_handler(target: Service | Router):
                 self.send_header("Retry-After", "30")
             self.send_header("Content-Type", "application/json")
             self._cors()
-            for _name, _value in extra:
-                self.send_header(_name, _value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -459,14 +469,13 @@ def make_handler(target: Service | Router):
                     self._json(200, {**router.shown().v1_status(), "models": router.models(), "swap": router.swap_status()})
             elif path == "/v1/ecm/ping":
                 # operator health (PING-CONTRACT): no auth, like /health - loopback-facing
-                # and read-only; it answers for the engine that answered, always attributed.
+                # and read-only; attribution rides every reply via send_response.
                 shown = router.shown()
                 code, body = ecm_ping.build(shown.model, shown.v1_status)
-                self._json(code, body, extra=(("x-ecm-engine", shown.model),))
+                self._json(code, body)
             elif path == "/v1/ecm":
                 shown = router.shown()
-                self._json(200, ecm_ping.table(shown.model, shown.v1_status),
-                           extra=(("x-ecm-engine", shown.model),))
+                self._json(200, ecm_ping.table(shown.model, shown.v1_status))
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
