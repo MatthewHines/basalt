@@ -24,7 +24,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
-from .. import client, decision_log, heal, home, ping
+from .. import client, decision_log, heal, home, lifecycle, ping
 from ..calibration import CALIBRATION_V1, demand_fits
 from .fake_engine import FakeEngine, RefusingEngine, WorkingEngine
 
@@ -112,6 +112,11 @@ def log_grammar() -> None:
         back = decision_log.read(path)
         assert len(back) == 1 and back[0]["id"] == e["id"], back
         assert back[0]["reason"] == "card is full, refusing to load"
+        # W2-4a grew the family with `window.*` (§6.1): in-family must validate,
+        # out-of-family must still be refused (the enum keeps machine checks honest).
+        decision_log.append(path, event="window.empty", decision="degraded",
+                            reason="open with zero children", operator_hint="x")
+        assert decision_log.read(path)[-1]["event"] == "window.empty"
 
 
 def log_monotonic() -> None:
@@ -390,6 +395,197 @@ def home_resolution() -> None:
         os.environ.update(saved)
 
 
+# ---------------------------------------------------------------- W2-4a watch predicates
+#
+# Fixtures are temp-dir window state + fake port truth - the same incident shapes the
+# card showed on 11-28, reproducible without a GPU: an OPEN window holding the card
+# with zero children, and a guest whose port answers while its model is unloaded.
+
+WATCH_NOW = 1_000_000.0
+
+
+def _write_window(root: str, name: str, *, returned: str = "0", abandoned: str = "0",
+                  yielded_at: int | None = None, delegs: str | None = "") -> str:
+    wdir = os.path.join(root, name)
+    os.makedirs(wdir, exist_ok=True)
+    state: dict = {"returned": returned, "abandoned": abandoned}
+    if yielded_at is not None:
+        state["yielded_at"] = str(yielded_at)
+    if delegs is not None:
+        state["delegs"] = delegs
+    with open(os.path.join(wdir, "state.json"), "w") as fh:
+        json.dump(state, fh)
+    return wdir
+
+
+_GUEST_LOADED = lambda: {"data": [{"id": "inkling", "status": {"value": "loaded"}}]}
+
+
+def _guest_unloaded() -> object:
+    return {"data": [{"id": "inkling", "status": {"value": "unloaded"}}]}
+
+
+def _guest_dark() -> object:
+    raise client.EngineError(0, "no answer (connection refused)",
+                             "http://127.0.0.1:8004/v1/models")
+
+
+def _watch(state_dir: str, path: str, *, loaded: bool = True, guest=_GUEST_LOADED,
+           free: int | None = 1_904):
+    return lifecycle.observe(
+        status_reader=lambda: {"loaded": loaded}, models_reader=guest,
+        free_reader=lambda: free, state_dir=state_dir, log_path=path,
+        now=lambda: WATCH_NOW)
+
+
+def watch_window_empty_fires_once() -> None:
+    """The incident #1 shape: OPEN, zero children, 400 s past grace -> window.empty +
+    the literal return --force line; a second read of the SAME episode logs NOTHING
+    new (episode law, §1)."""
+    lifecycle.reset_episodes()
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "decisions.jsonl")
+        _write_window(d, "w1", yielded_at=int(WATCH_NOW) - 400, delegs="")
+        obs = _watch(d, log)
+        assert obs["degraded"] == "window.empty", obs
+        alarm = obs["alarms"][0]
+        assert "zero registered children" in alarm["reason"], alarm
+        assert "return --window" in alarm["next"] and "/w1 --force" in alarm["next"], alarm
+        ids_before = [e["id"] for e in decision_log.read(log)]
+        assert len(ids_before) == 1 and ids_before[0] == obs["episode_ids"]["window.empty:w1"]
+        _watch(d, log)  # same episode, second ping
+        assert len(decision_log.read(log)) == 1, "episode re-logged while held"
+        # and the entry is a REAL degraded family entry (grammar + verbatim reason)
+        e = decision_log.read(log)[0]
+        assert e["event"] == "window.empty" and e["decision"] == "degraded", e
+        assert e["operator_hint"] == alarm["next"]
+
+
+def watch_empty_grace_and_children() -> None:
+    """No false alarms: inside grace the window is OPENING, not empty; a window WITH
+    registered children is running, not empty - neither may alarm."""
+    lifecycle.reset_episodes()
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "decisions.jsonl")
+        _write_window(d, "young", yielded_at=int(WATCH_NOW) - 60, delegs="")
+        obs = _watch(d, log)
+        assert obs["alarms"] == [], obs
+        _write_window(d, "busy", yielded_at=int(WATCH_NOW) - 900, delegs="deleg_1")
+        obs2 = _watch(d, log)
+        assert obs2["alarms"] == [], obs2
+        assert set(obs2["holders"]["open_windows"]) == {"young", "busy"}
+        assert decision_log.read(log) == [], "false alarms reached the ledger"
+
+
+def watch_delegs_unreadable_not_quiet() -> None:
+    """A state.json without a provable delegs field cannot CLAIM zero children: the
+    alarm says unreadable (naming the field), never window.empty off a guess."""
+    lifecycle.reset_episodes()
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "decisions.jsonl")
+        _write_window(d, "opaque", yielded_at=int(WATCH_NOW) - 900, delegs=None)
+        obs = _watch(d, log)
+        assert obs["degraded"] == "window.unreadable", obs
+        assert "delegs" in obs["alarms"][0]["reason"], obs
+        assert all(a["name"] != "window.empty" for a in obs["alarms"])
+
+
+def watch_starved_and_parking_lot() -> None:
+    """§1 predicate, all three legs: primary loaded + window OPEN + port dark ->
+    guest.starved. Same dark port with the primary UNLOADED is the intended PARKED
+    posture - inside grace, zero alarms (the parking lot is not an incident)."""
+    lifecycle.reset_episodes()
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "decisions.jsonl")
+        _write_window(d, "w1", yielded_at=int(WATCH_NOW) - 60, delegs="d1")
+        obs = _watch(d, log, loaded=True, guest=_guest_dark)
+        assert obs["degraded"] == "guest.starved", obs
+        reason = obs["alarms"][0]["reason"]
+        for leg in ("window w1 OPEN", "primary loaded", "port dark"):
+            assert leg in reason, f"leg missing: {leg} in {reason!r}"
+        lifecycle.reset_episodes()
+        obs2 = _watch(d, log, loaded=False, guest=_guest_dark)
+        assert obs2["alarms"] == [], f"parked posture alarmed: {obs2}"
+
+
+def watch_guest_dark_names_the_leg() -> None:
+    """The incident #2 trap: port answers, model unloaded, window open -> guest.dark
+    saying 'port-up is not model-up' out loud; priority over window.empty on the
+    degraded token (both alarms present, loudest truth first)."""
+    lifecycle.reset_episodes()
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "decisions.jsonl")
+        _write_window(d, "w1", yielded_at=int(WATCH_NOW) - 900, delegs="")
+        obs = _watch(d, log, loaded=False, guest=_guest_unloaded)
+        assert obs["degraded"] == "guest.dark", obs
+        names = [a["name"] for a in obs["alarms"]]
+        assert "guest.dark" in names and "window.empty" in names, names
+        dark = next(a for a in obs["alarms"] if a["name"] == "guest.dark")
+        assert "port-up is not model-up" in dark["reason"], dark
+        assert "unloaded" in dark["reason"], dark  # names its own reading
+
+
+def watch_parked_no_window() -> None:
+    """No window + dark guest port is HOME, not an incident: zero alarms, and the
+    holders story still reads the truth (§6.3 - one read, no archaeology)."""
+    lifecycle.reset_episodes()
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "decisions.jsonl")
+        obs = _watch(d, log, loaded=True, guest=_guest_dark)
+        assert obs["alarms"] == [] and obs["degraded"] is None, obs
+        assert obs["holders"]["guest_port"] == "dark"
+        assert obs["holders"]["primary_loaded"] is True
+        assert obs["holders"]["open_window"] is None
+        assert obs["holders"]["driver_free_mib"] == 1_904  # the measured healthy card
+
+
+def watch_holders_fail_closed() -> None:
+    """No driver truth is a NULL in the story, never a zero and never a guess."""
+    lifecycle.reset_episodes()
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "decisions.jsonl")
+        obs = _watch(d, log, free=None)
+        assert obs["holders"]["driver_free_mib"] is None, obs
+
+
+def watch_episode_refires_after_resolution() -> None:
+    """Episode law's other half: resolved -> memory clears -> a RE-CURRENCE earns a
+    fresh entry (an honest duplicate beats lost truth)."""
+    lifecycle.reset_episodes()
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "decisions.jsonl")
+        _write_window(d, "w1", yielded_at=int(WATCH_NOW) - 900, delegs="")
+        assert _watch(d, log)["degraded"] == "window.empty"
+        _write_window(d, "w1", yielded_at=int(WATCH_NOW) - 900, delegs="deleg_1")
+        obs2 = _watch(d, log)
+        assert obs2["alarms"] == [] and obs2["episode_ids"] == {}, obs2
+        _write_window(d, "w1", yielded_at=int(WATCH_NOW) - 900, delegs="")
+        assert _watch(d, log)["degraded"] == "window.empty"
+        events = [(e["event"], e["id"]) for e in decision_log.read(log)]
+        assert len(events) == 2 and events[0][0] == events[1][0] == "window.empty", events
+        assert events[0][1] != events[1][1], "re-fire reused the old id"
+
+
+def ping_carries_watch() -> None:
+    """Armed: holders/alarms/degraded ride the ping body. Unwired: the body SAYS it was
+    not read - an unwired watch is never an all-clear."""
+    lifecycle.reset_episodes()
+    eng = WorkingEngine()
+    try:
+        code0, b0 = ping.build("fake-qwen", _status(eng))
+        assert b0["watch"].startswith("not wired") and b0["holders"] is None, b0
+        obs = {"holders": {"driver_free_mib": 1904, "open_window": "w1"},
+               "alarms": [{"name": "window.empty", "reason": "r", "next": "n"}],
+               "degraded": "window.empty"}
+        code, body = ping.build("fake-qwen", _status(eng), watch=obs)
+        assert code == 200 and body["watch"] == "armed", body
+        assert body["degraded"] == "window.empty"
+        assert body["holders"]["open_window"] == "w1"
+        assert len(body["alarms"]) == 1
+    finally:
+        eng.stop()
+
+
 def registry_honest() -> None:
     """Every pending branch names an owning slice, and the runner's own data shows no
     pending branch can report PASS (fn is None iff owner is set)."""
@@ -432,6 +628,16 @@ BRANCHES: list[Branch] = [
     Branch("heal.unreadable-driver", heal_unreadable_driver),
     Branch("home.resolution", home_resolution),
     Branch("registry.honest", registry_honest),
+    # W2-4a lifecycle OBSERVATION (ECM-W2-4-DESIGN §1/§6 - the 11-28 incidents):
+    Branch("watch.window-empty-fires-once", watch_window_empty_fires_once),
+    Branch("watch.empty-grace-and-children", watch_empty_grace_and_children),
+    Branch("watch.delegs-unreadable-not-quiet", watch_delegs_unreadable_not_quiet),
+    Branch("watch.starved-and-parking-lot", watch_starved_and_parking_lot),
+    Branch("watch.guest-dark-names-the-leg", watch_guest_dark_names_the_leg),
+    Branch("watch.parked-no-window", watch_parked_no_window),
+    Branch("watch.holders-fail-closed", watch_holders_fail_closed),
+    Branch("watch.episode-refires", watch_episode_refires_after_resolution),
+    Branch("ecm-ping.carries-watch", ping_carries_watch),
     # BENCH-BRANCHES.md minimum list, owned per ECM-W2-DESIGN §7 slicing:
     Branch("B-1.wake-happy-path", None, "W2-4"),
     Branch("B-2.refusal-rollback", None, "W2-3"),

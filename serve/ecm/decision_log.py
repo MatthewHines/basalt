@@ -16,7 +16,8 @@ import time
 from datetime import datetime, timezone
 
 EVENT_RE = re.compile(
-    r"^(guest|primary|lease|mode|socket|heal|handback|wake_detector)\.[a-z][a-z_.]*$")
+    r"^(guest|primary|lease|mode|socket|window|heal|handback|wake_detector)"
+    r"\.[a-z][a-z_.]*$")
 DECISIONS = frozenset(("observe", "allow", "refuse", "rollback", "degraded", "already"))
 SOURCES = frozenset(("ecm", "bench", "manual"))
 # decisions that are failures-of-some-kind: they MUST carry a verbatim reason and a literal remedy

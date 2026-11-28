@@ -24,6 +24,7 @@ from serve.api.documents import sources as document_sources
 from serve.ecm import home as ecm_home
 from serve.ecm import ping as ecm_ping
 from serve.ecm import heal as ecm_heal
+from serve.ecm import lifecycle as ecm_lifecycle
 from serve.ecm import client as ecm_client
 from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
@@ -73,6 +74,17 @@ def request_path(target: str) -> str:
 
 def _size_text(n: int) -> str:
     return f"{n >> 20} MiB" if n >= 1 << 20 else f"{n >> 10} KiB"
+
+
+def _ecm_watch(shown) -> dict:
+    """One armed lifecycle read for the operator routes (serve/ecm/lifecycle.py):
+    holders + alarms + once-per-episode ledger entries. Read-only by construction -
+    it never boots, wakes, or reaps; swarm-ctl keeps the verbs."""
+    return ecm_lifecycle.observe(
+        status_reader=shown.v1_status,
+        models_reader=lambda: ecm_client.get_json(ecm_lifecycle.GUEST_MODELS_URL,
+                                                  timeout=2.0),
+        log_path=ecm_home.decision_log_path())
 
 
 def make_handler(target: Service | Router):
@@ -474,14 +486,18 @@ def make_handler(target: Service | Router):
             elif path == "/v1/ecm/ping":
                 # operator health (PING-CONTRACT): no auth, like /health - loopback-facing
                 # and read-only; attribution rides every reply via send_response.
+                # W2-4a: the ping answers with the lifecycle watch ARMED (holders + alarms
+                # + episode entries) - one read, the whole card story (§6.3).
                 shown = router.shown()
                 code, body = ecm_ping.build(shown.model, shown.v1_status,
-                                            log_path=ecm_home.decision_log_path())
+                                            log_path=ecm_home.decision_log_path(),
+                                            watch=_ecm_watch(shown))
                 self._json(code, body)
             elif path == "/v1/ecm":
                 shown = router.shown()
                 self._json(200, ecm_ping.table(shown.model, shown.v1_status,
-                                               log_path=ecm_home.decision_log_path()))
+                                               log_path=ecm_home.decision_log_path(),
+                                               watch=_ecm_watch(shown)))
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -636,14 +652,10 @@ def make_handler(target: Service | Router):
                         raise TimeoutError("primary did not reach loaded within 300 s")
 
                     def _driver_free() -> int | None:
-                        gpu = str(int(getattr(shown, "gpu_index", 0) or 0))
-                        run = subprocess.run(
-                            ["nvidia-smi", "-i", gpu, "--query-gpu=memory.free",
-                             "--format=csv,noheader,nounits"],
-                            capture_output=True, text=True, timeout=8)
-                        if run.returncode != 0:
-                            return None
-                        return int(float(run.stdout.strip().splitlines()[0]))
+                        # ONE driver-truth reader (serve/ecm/lifecycle.py), generous
+                        # timeout here: a verb may wait on a busy card, a ping may not.
+                        return ecm_lifecycle.driver_free(
+                            getattr(shown, "gpu_index", 0), timeout=8.0)
 
                     def _window_guard() -> str | None:
                         root = "/out/window/inkling"  # the bind's container side; the open predicate is swarm-ctl's C5/D4 law

@@ -59,12 +59,26 @@ def _log_view(path: str | None) -> dict:
 def build(engine: str, primary_status: Callable[[], dict],
           guest: Callable[[], dict | None] | None = None,
           log_path: str | None = None, *, now: Callable[[], float] = time.time,
+          watch: dict | None = None,
           ) -> tuple[int, dict]:
     """Returns (http_status, body). 200 only when the primary is readable and the guest
-    state is a confirmed one; every refusal carries the full shape (PC-4)."""
+    state is a confirmed one; every refusal carries the full shape (PC-4).
+
+    `watch` is the lifecycle observation (serve/ecm/lifecycle.observe) precomputed by
+    the caller: holders + alarms from the W2-4a predicates. Absent means NOT WIRED,
+    which the body says honestly — an unwired watch is never an all-clear (unreadable
+    is not quiet; not-read is not read)."""
     log = _log_view(log_path)
     body: dict = {"ok": False, "engine": engine, "checked_at": int(now()),
-                  "primary": None, "guest": None, "decision_log": log, "degraded": None}
+                  "primary": None, "guest": None, "decision_log": log, "degraded": None,
+                  "holders": None, "alarms": None,
+                  "watch": "not wired — W2-4a predicates not read this ping"}
+    if watch is not None:
+        body["holders"] = watch.get("holders")
+        body["alarms"] = watch.get("alarms")
+        body["watch"] = "armed"
+        if watch.get("degraded") and body["degraded"] is None:
+            body["degraded"] = watch["degraded"]  # §1: the contract field carries the hold
 
     try:
         status = primary_status()
@@ -122,18 +136,20 @@ def build(engine: str, primary_status: Callable[[], dict],
 def table(engine: str, primary_status: Callable[[], dict],
           guest: Callable[[], dict | None] | None = None,
           log_path: str | None = None, *, cap: int = 20,
+          watch: dict | None = None,
           ) -> dict:
     """The drill view (GET /v1/ecm): the same live reads as the ping, plus the last
     `cap` decision-log entries, oldest first. Read-only, like the ping - a capped tail,
     never the whole file on the wire."""
-    code, body = build(engine, primary_status, guest, log_path)
+    code, body = build(engine, primary_status, guest, log_path, watch=watch)
     entries: list[dict] = []
     if log_path:
         entries = decision_log.read(log_path)[-cap:]
     return {"ok": body["ok"], "http": code, "engine": engine,
             "state": body.get("state"), "primary": body.get("primary"),
             "guest": body.get("guest"), "reason": body.get("reason"),
-            "decisions": entries}
+            "holders": body.get("holders"), "alarms": body.get("alarms"),
+            "degraded": body.get("degraded"), "decisions": entries}
 
 
 def _refusal(reason: str) -> dict:
