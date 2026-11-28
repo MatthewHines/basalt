@@ -510,19 +510,25 @@ def watch_starved_and_parking_lot() -> None:
 
 def watch_guest_dark_names_the_leg() -> None:
     """The incident #2 trap: port answers, model unloaded, window open -> guest.dark
-    saying 'port-up is not model-up' out loud; priority over window.empty on the
-    degraded token (both alarms present, loudest truth first)."""
+    saying 'port-up is not model-up' out loud. REVERSED LAW (ecmw24f F5): with an EMPTY
+    round both alarms fire and window.empty leads the degraded token — closing the
+    window is the cure for the dark symptom; the dark alarm still NAMES itself."""
     lifecycle.reset_episodes()
     with tempfile.TemporaryDirectory() as d:
         log = os.path.join(d, "decisions.jsonl")
         _write_window(d, "w1", yielded_at=int(WATCH_NOW) - 900, delegs="")
         obs = _watch(d, log, loaded=False, guest=_guest_unloaded)
-        assert obs["degraded"] == "guest.dark", obs
+        assert obs["degraded"] == "window.empty", obs
         names = [a["name"] for a in obs["alarms"]]
         assert "guest.dark" in names and "window.empty" in names, names
         dark = next(a for a in obs["alarms"] if a["name"] == "guest.dark")
         assert "port-up is not model-up" in dark["reason"], dark
         assert "unloaded" in dark["reason"], dark  # names its own reading
+        # and with CHILDREN present (not empty), dark is the headline again
+        lifecycle.reset_episodes()
+        _write_window(d, "w1", yielded_at=int(WATCH_NOW) - 900, delegs="deleg_1")
+        obs2 = _watch(d, log, loaded=False, guest=_guest_unloaded)
+        assert obs2["degraded"] == "guest.dark", obs2
 
 
 def watch_parked_no_window() -> None:
@@ -564,6 +570,62 @@ def watch_episode_refires_after_resolution() -> None:
         events = [(e["event"], e["id"]) for e in decision_log.read(log)]
         assert len(events) == 2 and events[0][0] == events[1][0] == "window.empty", events
         assert events[0][1] != events[1][1], "re-fire reused the old id"
+
+
+def watch_numeric_returned_reads_open() -> None:
+    """REVIEW F1 fixture: a hand-edited state.json with numeric returned:0 (and
+    abandoned:0) must read OPEN — same alarm, same literal — never silently closed."""
+    lifecycle.reset_episodes()
+    # REVIEW F2 beside its own law: the known bind translates to the HOST path so the
+    # printed next-command is paste-ready; an unknown state_dir passes through untouched.
+    assert lifecycle._host_path("/out/window/inkling/wX", lifecycle.STATE_DIR) == \
+        os.path.join(lifecycle.HOST_STATE_DIR, "wX")
+    assert lifecycle._host_path("/tmp/other/wX", "/tmp/other") == "/tmp/other/wX"
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "decisions.jsonl")
+        wd = os.path.join(d, "numwin")
+        os.makedirs(wd)
+        with open(os.path.join(wd, "state.json"), "w", encoding="utf-8") as fh:
+            json.dump({"returned": 0, "abandoned": 0,
+                       "yielded_at": str(int(WATCH_NOW) - 400), "delegs": ""}, fh)
+        obs = _watch(d, log)
+        assert obs["degraded"] == "window.empty", obs
+        assert "numwin" in obs["holders"]["open_windows"], obs
+
+
+def watch_wrong_engine_list_absent() -> None:
+    """REVIEW F3 fixture: a port that answers with SOMEONE ELSE'S model list (no id
+    matching GUEST_MODEL_ID) reports model 'absent' naming what it saw — and inside an
+    OPEN window that is guest.dark, never a borrowed status from the wrong engine."""
+    lifecycle.reset_episodes()
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "decisions.jsonl")
+        _write_window(d, "w1", yielded_at=int(WATCH_NOW) - 60, delegs="d1")
+        obs = _watch(d, log, loaded=False,
+                     guest=lambda: {"data": [{"id": "qwen3.8-flash-next-basalt",
+                                              "status": {"value": "loaded"}}]})
+        assert obs["holders"]["guest_model"] == "absent", obs
+        assert obs["degraded"] == "guest.dark", obs
+        assert "no 'inkling' in the list" in obs["alarms"][0]["reason"], obs
+
+
+def log_flock_concurrent_appends() -> None:
+    """REVIEW F6 fixture: 8 threads appending at once — the file must READ back clean
+    (monotonic ids, 8 entries). Before flock this raced into duplicate ids."""
+    import threading as _th
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "decisions.jsonl")
+        threads = [_th.Thread(target=lambda i=i: decision_log.append(
+            path, event="heal.checked", decision="observe", reason=f"t{i}",
+            operator_hint="none")) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        entries = decision_log.read(path)     # raises on any duplicate/interleave
+        assert len(entries) == 8, len(entries)
+        ids = [e["id"] for e in entries]
+        assert len(set(ids)) == 8, f"duplicate ids: {ids}"
 
 
 def ping_carries_watch() -> None:
@@ -637,6 +699,9 @@ BRANCHES: list[Branch] = [
     Branch("watch.parked-no-window", watch_parked_no_window),
     Branch("watch.holders-fail-closed", watch_holders_fail_closed),
     Branch("watch.episode-refires", watch_episode_refires_after_resolution),
+    Branch("watch.numeric-returned-reads-open", watch_numeric_returned_reads_open),
+    Branch("watch.wrong-engine-list-absent", watch_wrong_engine_list_absent),
+    Branch("log.flock-concurrent-appends", log_flock_concurrent_appends),
     Branch("ecm-ping.carries-watch", ping_carries_watch),
     # BENCH-BRANCHES.md minimum list, owned per ECM-W2-DESIGN §7 slicing:
     Branch("B-1.wake-happy-path", None, "W2-4"),

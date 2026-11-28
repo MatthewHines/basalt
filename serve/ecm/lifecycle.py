@@ -24,15 +24,29 @@ from . import client, decision_log
 
 STATE_DIR = "/out/window/inkling"          # the window bind's CONTAINER side
 GUEST_MODELS_URL = "http://127.0.0.1:8004/v1/models"
+# REVIEW F3: whose model list counts as the guest. Overridable for benches/alt models.
+GUEST_MODEL_ID = os.environ.get("ECM_GUEST_MODEL_ID", "inkling")
 SWARMCTL = "/var/home/mhines/basalt-test/window/inkling/swarm-ctl.sh"
+HOST_STATE_DIR = "/var/home/mhines/basalt-test/window/inkling"   # the bind's HOST side
 # The card deserves a shorter answer than the defer flag's 4 h TTL (§6.1): five minutes
 # of an OPEN window with zero children is an alarm, not a wait.
 EMPTY_WINDOW_S = 300
-# degraded = ONE token on the ping; priority order for the loudest truth (design §1 family)
-ALARM_PRIORITY = ("guest.starved", "guest.dark", "window.unreadable", "window.empty")
+# degraded = ONE token on the ping. REVIEW F5 (ecmw24f): window.empty LEADS — the one
+# action that frees a card held by a stale round is closing the window; dark/starved are
+# then symptoms of exactly that round, and must not outrank their own cause.
+ALARM_PRIORITY = ("window.empty", "guest.starved", "guest.dark", "window.unreadable")
 
 _episodes: dict[str, str] = {}             # episode key -> first entry id (in-process)
 _lock = threading.Lock()
+
+
+def _host_path(window_dir: str, state_dir: str) -> str:
+    """REVIEW F2: a paste-ready command must name HOST paths. The same directory reads
+    as /out/window/inkling/<name> from inside the container; the operator's shell (and
+    host-side swarm-ctl) cannot use that. Translate only the known bind."""
+    if state_dir == STATE_DIR and window_dir.startswith(state_dir):
+        return HOST_STATE_DIR + window_dir[len(state_dir):]
+    return window_dir
 
 
 def window_facts(state_dir: str = STATE_DIR) -> tuple[list[dict], list[str]]:
@@ -60,7 +74,12 @@ def window_facts(state_dir: str = STATE_DIR) -> tuple[list[dict], list[str]]:
         if not isinstance(d, dict):
             problems.append(f"window {name}: state.json is not an object")
             continue
-        if d.get("returned", "0") == "0" and d.get("abandoned", "0") != "1":
+        # REVIEW F1 (ecmw24f): swarm-ctl writes strings, but a hand-edited state.json can
+        # carry a JSON NUMBER 0 — which must still read OPEN. Coerce; never let a type
+        # difference silently close a card-holding window.
+        returned = str(d.get("returned", "0")).strip()
+        abandoned = str(d.get("abandoned", "0")).strip()
+        if returned in ("0", "0.0") and abandoned != "1":
             try:
                 yielded = int(d.get("yielded_at", ""))
             except (TypeError, ValueError):
@@ -89,14 +108,23 @@ def guest_truth(models_reader: Callable[[], object]) -> dict:
     if not isinstance(models, list) or not models:
         return {"port": "up", "model": "unknown-shape",
                 "detail": f"answered but not a model list: {str(data)[:120]}"}
-    for m in models:
-        status = m.get("status") if isinstance(m, dict) else None
+    # REVIEW F3 (ecmw24f): the list must be the GUEST's list. Match the model by the id
+    # the guest serves; an absent id is a wrong-engine answer, never a status read off
+    # someone else's model (first-loaded-model-wins was the 11-28 trap, inverted).
+    named = [m for m in models if isinstance(m, dict) and str(m.get("id")) == GUEST_MODEL_ID]
+    if not named:
+        seen = [str(m.get("id")) for m in models if isinstance(m, dict)][:4]
+        return {"port": "up", "model": "absent",
+                "detail": f"port answers with {seen} — no {GUEST_MODEL_ID!r} in the list "
+                          f"(wrong engine on this port?) — port-up is not guest-up"}
+    for m in named:
+        status = m.get("status")
         value = status.get("value") if isinstance(status, dict) else None
         if isinstance(value, str):
             return {"port": "up", "model": value,
                     "detail": f"port answers, model {m.get('id')!r} reports {value!r}"}
     return {"port": "up", "model": "unknown-shape",
-            "detail": "answered a model list carrying no status.value"}
+            "detail": f"{GUEST_MODEL_ID!r} listed with no status.value"}
 
 
 def driver_free(gpu_index: int = 0, timeout: float = 2.0) -> int | None:
@@ -175,7 +203,7 @@ def evaluate(*, primary_loaded: bool | None, opens: list[dict], problems: list[s
                               f"children and nothing to run — the card is held by an "
                               f"empty round",
                     "next": f"bash {SWARMCTL} return --window "
-                            f"{os.path.join(state_dir, name)} --force"})
+                            f"{_host_path(os.path.join(state_dir, name), state_dir)} --force"})
     degraded = None
     for name in ALARM_PRIORITY:
         if any(a["name"] == name for a in alarms):

@@ -93,10 +93,28 @@ def append(path: str, *, event: str, decision: str = "observe", source: str = "e
             entry[field] = value
     validate(entry)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
+    # REVIEW F6 (ecmw24f): the log is rw-bound into both engines — concurrent appenders
+    # must not interleave id-selection with the write (two readers, same previous id →
+    # duplicate ids → the file becomes UNREADABLE to read()'s monotonic law). One
+    # exclusive flock on a sibling lockfile spans last_id→fsync; a fresh file's first
+    # writer may briefly duplicate id -0000 — the reader names it, never guesses.
+    try:
+        import fcntl
+    except ImportError:      # non-POSIX: same single-writer assumption as before F6
+        fcntl = None         # type: ignore[assignment]
+    lock_fh = open(path + ".lock", "w") if fcntl else None
+    try:
+        if fcntl and lock_fh:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        entry["id"] = new_id(last_id(path))
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    finally:
+        if fcntl and lock_fh:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            lock_fh.close()
     return entry
 
 
